@@ -8,10 +8,10 @@ Install:
     pip install genlayer-test
 
 Run:
-    pytest tests/test_escrow_contract.py -v
+    pytest test_escrow_contract.py -v
 """
 
-CONTRACT_PATH = "contracts/escrow_contract.py"
+CONTRACT_PATH = "escrow_contract.py"
 SPEC = "Deliver a landing page with a working email signup form."
 GOOD_DELIVERABLE = (
     "Landing page deployed at example.com with a working signup form "
