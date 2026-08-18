@@ -59,8 +59,15 @@ def test_happy_path_releases_funds_on_approval(direct_vm, direct_deploy, direct_
 
     contract.resolve()  # resolve() is permissionless - any sender works
 
-    assert contract.get_status() == "RELEASED"
+    assert contract.get_status() == "APPROVED"
     assert contract.get_verdict_reason() != ""
+
+    # Worker claims the approved payment in a separate transaction.
+    direct_vm.sender = direct_bob
+    contract.claim_payment()
+
+    # RELEASED is only set after the external payout is confirmed.
+    assert contract.get_status() == "APPROVED"
 
 
 def test_rejection_allows_resubmission_until_max_revisions(

@@ -20,6 +20,15 @@ from genlayer import *
 import json
 
 
+@gl.evm.contract_interface
+class _Recipient:
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
 class EscrowWithIntelligentReview(gl.Contract):
     # ---- persistent state --------------------------------------------
     client: Address
@@ -28,7 +37,7 @@ class EscrowWithIntelligentReview(gl.Contract):
     deliverable: str
     verdict_reason: str
     status: str  # AWAITING_DEPOSIT | AWAITING_DELIVERY | UNDER_REVIEW
-                 # | RELEASED | DISPUTED | REFUNDED
+                 # | APPROVED | RELEASED | DISPUTED | REFUNDED
     agreed_amount: u256
     revision_count: u32
     max_revisions: u32
@@ -148,9 +157,7 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
         self.verdict_reason = verdict["reason"]
 
         if verdict["approved"]:
-            self.status = "RELEASED"
-            worker_account = gl.get_contract_at(self.worker)
-            worker_account.emit_transfer(value=self.agreed_amount)
+            self.status = "APPROVED"
         else:
             self.revision_count = u32(self.revision_count + 1)
             if self.revision_count >= self.max_revisions:
@@ -158,7 +165,28 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
             else:
                 self.status = "AWAITING_DELIVERY"
 
-    # ---- step 4 (only reached after max_revisions is exceeded) ----------
+    # ---- step 4: worker claims an approved payment -----------------------
+    @gl.public.write
+    def claim_payment(self) -> None:
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError("only the worker can claim payment")
+        if self.status != "APPROVED":
+            raise gl.vm.UserError(f"cannot claim payment from status {self.status}")
+        if self.balance < self.agreed_amount:
+            raise gl.vm.UserError("escrow balance is insufficient for payment")
+
+        _Recipient(self.worker).emit_transfer(value=self.agreed_amount)
+
+    @gl.public.write
+    def confirm_payment(self) -> None:
+        if self.status != "APPROVED":
+            raise gl.vm.UserError(f"cannot confirm payment from status {self.status}")
+        if self.balance != u256(0):
+            raise gl.vm.UserError("payment has not completed yet")
+
+        self.status = "RELEASED"
+
+    # ---- step 5 (only reached after max_revisions is exceeded) ----------
     @gl.public.write
     def claim_refund(self) -> None:
         if gl.message.sender_address != self.client:
@@ -166,8 +194,7 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
         if self.status != "DISPUTED":
             raise gl.vm.UserError(f"cannot refund from status {self.status}")
         self.status = "REFUNDED"
-        client_account = gl.get_contract_at(self.client)
-        client_account.emit_transfer(value=self.agreed_amount)
+        _Recipient(self.client).emit_transfer(value=self.agreed_amount)
 
     # ---- read-only views --------------------------------------------------
     @gl.public.view
