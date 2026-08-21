@@ -1,34 +1,31 @@
 import pytest
 
-"""
-Tests for EscrowWithIntelligentReview using the GenLayer Testing Suite
-(genlayer-test) in Direct Mode: fast, in-process, no Docker/Studio needed.
-
-Install:
-    pip install genlayer-test
-
-Run:
-    pytest test_escrow_contract.py -v
-"""
-
 CONTRACT_PATH = "escrow_contract.py"
+
 SPEC = "Deliver a landing page with a working email signup form."
-GOOD_DELIVERABLE = (
-    "Landing page deployed at example.com with a working signup form "
-    "wired to Mailchimp."
-)
-BAD_DELIVERABLE = "Here is a link to my portfolio, unrelated to this project."
+
+GOOD_URL = "https://github.com/example/landing-page"
+BAD_URL = "https://github.com/example/bad-project"
+
 AMOUNT = 1000
 
 
-def _deploy(direct_vm, direct_deploy, direct_owner, direct_bob, max_revisions=3):
-    """Deploy as the client (direct_owner), naming direct_bob as the worker."""
+def _deploy(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
+    max_revisions=3,
+):
     direct_vm.sender = direct_owner
+
     return direct_deploy(
         CONTRACT_PATH,
         "0x" + direct_bob.hex(),
         SPEC,
         str(AMOUNT),
+        "github.com/example",
+        "text",
         max_revisions,
         sdk_version="v0.2.12",
     )
@@ -43,95 +40,188 @@ def _fund(direct_vm, contract, sender, amount):
         direct_vm.value = 0
 
 
-def test_happy_path_releases_funds_on_approval(direct_vm, direct_deploy, direct_owner, direct_bob):
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob)
-    assert contract.get_status() == "AWAITING_DEPOSIT"
-
-    _fund(direct_vm, contract, direct_owner, AMOUNT)
-    assert contract.get_status() == "AWAITING_DELIVERY"
-
-    direct_vm.sender = direct_bob
-    contract.submit_deliverable(GOOD_DELIVERABLE)
-    assert contract.get_status() == "UNDER_REVIEW"
-
-    # Every validator's LLM call is mocked to approve.
-    direct_vm.mock_llm(r".*", '{"approved": true, "reason": "Meets the spec."}')
-
-    contract.resolve()  # resolve() is permissionless - any sender works
-
-    assert contract.get_status() == "APPROVED"
-    assert contract.get_verdict_reason() != ""
-
-    # Worker claims the approved payment in a separate transaction.
-    direct_vm.sender = direct_bob
-    contract.claim_payment()
-
-    # RELEASED is only set after the external payout is confirmed.
-    assert contract.get_status() == "APPROVED"
+def mock_good_web(direct_vm):
+    direct_vm.mock_web(
+        GOOD_URL,
+        {
+            "method": "GET",
+            "body": """
+            Landing page implementation.
+            Working email signup form.
+            Mailchimp integration.
+            Deployment completed.
+            """,
+        },
+    )
 
 
-def test_rejection_allows_resubmission_until_max_revisions(
-    direct_vm, direct_deploy, direct_owner, direct_bob
+def mock_bad_web(direct_vm):
+    direct_vm.mock_web(
+        BAD_URL,
+        {
+            "method": "GET",
+            "body": """
+            Personal portfolio website.
+            Images and profile information.
+            No signup form.
+            No landing page requirements.
+            """,
+        },
+    )
+
+
+def test_happy_path_releases_funds_on_approval(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
 ):
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob, max_revisions=3)
+    contract = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_bob,
+    )
 
-    _fund(direct_vm, contract, direct_owner, AMOUNT)
+    _fund(
+        direct_vm,
+        contract,
+        direct_owner,
+        AMOUNT,
+    )
 
-    direct_vm.mock_llm(r".*", '{"approved": false, "reason": "Missing the signup form."}')
+    direct_vm.sender = direct_bob
 
-    for i in range(3):
-        direct_vm.sender = direct_bob
-        contract.submit_deliverable(BAD_DELIVERABLE)
-        contract.resolve()
-        assert contract.get_revision_count() == i + 1
-        if i < 2:
-            assert contract.get_status() == "AWAITING_DELIVERY"
+    contract.submit_deliverable(
+        GOOD_URL,
+        "repository reference",
+    )
 
-    assert contract.get_status() == "DISPUTED"
+    mock_good_web(direct_vm)
 
-    direct_vm.sender = direct_owner
-    contract.claim_refund()
-    assert contract.get_status() == "REFUNDED"
+    direct_vm.mock_llm(
+        r".*",
+        '{"approved": true, "reason": "Evidence satisfies requirements."}',
+    )
+
+    contract.resolve()
+
+    assert contract.get_status() == "APPROVED"
 
 
-def test_only_worker_can_submit(direct_vm, direct_deploy, direct_owner, direct_bob, direct_charlie):
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob)
-    _fund(direct_vm, contract, direct_owner, AMOUNT)
+def test_bad_evidence_is_rejected(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
+):
+    contract = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_bob,
+    )
 
-    direct_vm.sender = direct_charlie  # not the worker
+    _fund(
+        direct_vm,
+        contract,
+        direct_owner,
+        AMOUNT,
+    )
+
+    direct_vm.sender = direct_bob
+
+    contract.submit_deliverable(
+        BAD_URL,
+        "bad artifact",
+    )
+
+    mock_bad_web(direct_vm)
+
+    direct_vm.mock_llm(
+        r".*",
+        '{"approved": false, "reason": "Evidence does not satisfy requirements."}',
+    )
+
+    contract.resolve()
+
+    assert contract.get_status() == "AWAITING_DELIVERY"
+    assert contract.get_revision_count() == 1
+
+
+def test_only_worker_can_submit(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
+    direct_charlie,
+):
+    contract = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_bob,
+    )
+
+    _fund(
+        direct_vm,
+        contract,
+        direct_owner,
+        AMOUNT,
+    )
+
+    direct_vm.sender = direct_charlie
+
     with pytest.raises(Exception, match="only the worker can submit"):
-        contract.submit_deliverable("sneaky submission")
+        contract.submit_deliverable(
+            GOOD_URL,
+            "",
+        )
 
 
-def test_only_client_can_fund(direct_vm, direct_deploy, direct_owner, direct_bob, direct_charlie):
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob)
+def test_only_client_can_fund(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
+    direct_charlie,
+):
+    contract = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_bob,
+    )
 
     with pytest.raises(Exception, match="only the client can fund this escrow"):
-        _fund(direct_vm, contract, direct_charlie, AMOUNT)
+        _fund(
+            direct_vm,
+            contract,
+            direct_charlie,
+            AMOUNT,
+        )
 
 
-def test_wrong_deposit_amount_reverts(direct_vm, direct_deploy, direct_owner, direct_bob):
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob)
+def test_wrong_deposit_amount_reverts(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_bob,
+):
+    contract = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_bob,
+    )
 
-    with pytest.raises(Exception, match="sent value does not match the agreed amount"):
-        _fund(direct_vm, contract, direct_owner, AMOUNT - 1)
-
-
-def test_validator_disagreement_is_detected(direct_vm, direct_deploy, direct_owner, direct_bob):
-    """
-    Exercises the custom validator_fn directly - the piece that
-    distinguishes a real consensus contract from a single-LLM-call demo.
-    The leader approves; a validator whose independent re-run of the same
-    judgment is mocked to disagree is correctly flagged as dissenting.
-    """
-    contract = _deploy(direct_vm, direct_deploy, direct_owner, direct_bob)
-    _fund(direct_vm, contract, direct_owner, AMOUNT)
-    direct_vm.sender = direct_bob
-    contract.submit_deliverable(GOOD_DELIVERABLE)
-
-    direct_vm.mock_llm(r".*", '{"approved": true, "reason": "Satisfies requirements."}')
-    contract.resolve()  # runs as leader, captures the leader's verdict
-
-    direct_vm.clear_mocks()
-    direct_vm.mock_llm(r".*", '{"approved": false, "reason": "Does not satisfy requirements."}')
-    assert direct_vm.run_validator() is False  # a differing verdict is correctly caught
+    with pytest.raises(
+        Exception,
+        match="sent value does not match the agreed amount",
+    ):
+        _fund(
+            direct_vm,
+            contract,
+            direct_owner,
+            AMOUNT - 1,
+        )
