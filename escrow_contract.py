@@ -409,11 +409,14 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
                 # A validator that cannot acquire the evidence must not
                 # rubber-stamp the leader's verdict.
                 return False
-            # Partial field matching: only the `approved` decision has to
-            # agree. `reason` is free text and `fingerprint` reflects each
-            # validator's own fetch, both of which legitimately differ
-            # between independent runs even on an identical verdict.
-            return leader_result.calldata["approved"] == validator_data["approved"]
+            # Consensus is bound to the evidence, not only to the final
+            # boolean verdict.
+            return (
+                leader_result.calldata["approved"]
+                == validator_data["approved"]
+                and leader_result.calldata["fingerprint"]
+                == validator_data["fingerprint"]
+            )
 
         verdict = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
