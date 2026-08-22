@@ -368,9 +368,34 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
                 raw = gl.nondet.exec_prompt(prompt, response_format="json")
 
             data = _coerce_verdict(raw)
+
+            # Fail closed on malformed adjudicator output.
+            # Python truthiness is unsafe here: bool("false") is True.
+            # Only literal JSON booleans are accepted.
+            if not isinstance(data, dict):
+                approved = False
+                reason = "adjudicator returned a non-object JSON response"
+            else:
+                approved_raw = data.get("approved")
+                if approved_raw is True:
+                    approved = True
+                elif approved_raw is False:
+                    approved = False
+                else:
+                    approved = False
+
+                if approved_raw is not True and approved_raw is not False:
+                    reason = "adjudicator returned an invalid approved field"
+                else:
+                    reason_raw = data.get("reason", "")
+                    if isinstance(reason_raw, str) and reason_raw.strip():
+                        reason = reason_raw.strip()[:MAX_REASON_CHARS]
+                    else:
+                        reason = "adjudicator returned no valid reason"
+
             return {
-                "approved": bool(data["approved"]),
-                "reason": str(data["reason"])[:MAX_REASON_CHARS],
+                "approved": approved,
+                "reason": reason,
                 "fingerprint": fingerprint,
                 "excerpt": evidence[:MAX_EXCERPT_CHARS],
             }
