@@ -405,18 +405,21 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
                 return False
             try:
                 validator_data = leader_fn()
+
+                # Consensus is bound to the evidence, not only to the final
+                # boolean verdict. If leader and validator fetched different
+                # normalized content, they must not agree merely because both
+                # LLM runs happened to return the same `approved` value.
+                return (
+                    leader_result.calldata["approved"]
+                    == validator_data["approved"]
+                    and leader_result.calldata["fingerprint"]
+                    == validator_data["fingerprint"]
+                )
             except Exception:
-                # A validator that cannot acquire the evidence must not
-                # rubber-stamp the leader's verdict.
+                # Missing fields, failed acquisition, malformed output, or
+                # any validator-side error fails closed.
                 return False
-            # Consensus is bound to the evidence, not only to the final
-            # boolean verdict.
-            return (
-                leader_result.calldata["approved"]
-                == validator_data["approved"]
-                and leader_result.calldata["fingerprint"]
-                == validator_data["fingerprint"]
-            )
 
         verdict = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
@@ -442,11 +445,15 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
             raise gl.vm.UserError(f"cannot claim payment from status {self.status}")
         if self.balance < self.agreed_amount:
             raise gl.vm.UserError("escrow balance is insufficient for payment")
+
+        # Lock the payout state before scheduling the external transfer.
+        # A second claim_payment call can no longer pass the APPROVED check.
+        self.status = "PAYMENT_PENDING"
         _Recipient(self.worker).emit_transfer(value=self.agreed_amount)
 
     @gl.public.write
     def confirm_payment(self) -> None:
-        if self.status != "APPROVED":
+        if self.status != "PAYMENT_PENDING":
             raise gl.vm.UserError(f"cannot confirm payment from status {self.status}")
         if self.balance != u256(0):
             raise gl.vm.UserError("payment has not completed yet")
