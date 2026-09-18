@@ -6,9 +6,15 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  direct-mode:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+
+    env:
+      # SHA-256 of genvm-universal.tar.xz for the pinned release. Checked after
+      # every restore or download so a changed or replaced upstream asset fails
+      # loudly instead of silently changing the runtime under test.
+      GENVM_SHA256: 4f0b358ec98ec148be9b95cdfb0f0e1a6cbe64da0194fdfac3fffc6f5d1d93e2
 
     steps:
       - name: Checkout repository
@@ -19,15 +25,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install pinned test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "genlayer-py==0.16.3" "genlayer-test==0.29.2" "pytest==9.1.1" numpy
+          python -m pip install -r requirements-test.txt
 
-      - name: Check Python syntax
+      - name: Read pinned GenVM version from conftest.py
+        id: genvm
         run: |
-          python -m py_compile escrow_contract.py
-          python -m py_compile test_fund.py
+          VERSION=$(python -c "import re; print(re.search(r'GENVM_VERSION = \"([^\"]+)\"', open('conftest.py').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pinned GenVM: $VERSION"
 
-      - name: Verify Direct Mode tests are discoverable
-        run: pytest test_fund.py --collect-only -q
+      - name: Restore GenVM cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gltest-direct
+          key: gltest-direct-${{ steps.genvm.outputs.version }}-${{ env.GENVM_SHA256 }}
+
+      - name: Fetch and verify pinned GenVM
+        run: |
+          python -c "from gltest.direct.sdk_loader import download_artifacts; print(download_artifacts('${{ steps.genvm.outputs.version }}'))"
+          echo "${GENVM_SHA256}  $HOME/.cache/gltest-direct/genvm-universal-${{ steps.genvm.outputs.version }}.tar.xz" | sha256sum -c -
+
+      - name: Run full Direct Mode test suite
+        run: python -m pytest -v -rA -p no:cacheprovider
