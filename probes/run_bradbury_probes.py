@@ -35,6 +35,7 @@ from pathlib import Path
 from genlayer_py import create_account, create_client
 from genlayer_py.chains import testnet_bradbury
 from genlayer_py.types import TransactionStatus
+import requests
 
 HERE = Path(__file__).resolve().parent
 CONTRACT = HERE / "runtime_probe.py"
@@ -89,11 +90,23 @@ class Recorder:
 
 
 def contract_address_from(receipt) -> str:
-    if "tx_data_decoded" in receipt and "contract_address" in receipt["tx_data_decoded"]:
-        return receipt["tx_data_decoded"]["contract_address"]
-    if "data" in receipt and "contract_address" in receipt["data"]:
-        return receipt["data"]["contract_address"]
-    raise ValueError("receipt has no contract_address")
+    decoded = receipt.get("tx_data_decoded")
+    if isinstance(decoded, dict):
+        address = decoded.get("contract_address")
+        if address:
+            return address
+
+    data = receipt.get("data")
+    if isinstance(data, dict):
+        address = data.get("contract_address")
+        if address:
+            return address
+
+    recipient = receipt.get("recipient")
+    if isinstance(recipient, str) and recipient.startswith("0x") and len(recipient) == 42:
+        return recipient
+
+    raise ValueError("receipt has no contract_address or deployment recipient")
 
 
 def main() -> int:
@@ -106,6 +119,48 @@ def main() -> int:
     rec = Recorder(RESULTS_DIR / f"bradbury-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json")
     account = create_account(key)
     client = create_client(chain=testnet_bradbury, account=account)
+
+    # Bradbury currently returns gen_call as:
+    #   {"result": {"data": "<calldata hex>", "status": {...}, ...}}
+    # genlayer-py 0.16.3 expects:
+    #   {"result": "<calldata hex>"}
+    #
+    # Adapt only gen_call responses, while keeping the SDK's own calldata
+    # decoder and all other provider behaviour unchanged.
+    _provider_make_request = client.provider.make_request
+
+    def _compat_make_request(method, params):
+        response = _provider_make_request(method=method, params=params)
+
+        if method != "gen_call" or not isinstance(response, dict):
+            return response
+
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return response
+
+        status = result.get("status")
+        if isinstance(status, dict):
+            code = status.get("code", 0)
+            if code not in (0, "0", None):
+                raise RuntimeError(
+                    f"gen_call failed: code={code}, "
+                    f"message={status.get('message')}, "
+                    f"stderr={result.get('stderr', '')}"
+                )
+
+        data = result.get("data")
+        if not isinstance(data, str):
+            raise RuntimeError(
+                f"gen_call result missing string data: {result!r}"
+            )
+
+        adapted = dict(response)
+        adapted["result"] = data
+        return adapted
+
+    client.provider.make_request = _compat_make_request
+
     owner = account.address
     recipient = os.environ.get("PROBE_EOA_RECIPIENT", owner)
     rec.data["owner_address"] = owner
@@ -117,28 +172,181 @@ def main() -> int:
 
     def wait(tx_hash, status, probe, label):
         t0 = time.time()
-        try:
-            r = client.wait_for_transaction_receipt(
-                transaction_hash=tx_hash, status=status, interval=5000, retries=int(POLL_MIN * 60 / 5) + 60
-            )
-            rec.add(probe, f"{label}:{status.value}", tx=str(tx_hash), seconds=round(time.time() - t0, 1), receipt=r)
-            return r
-        except Exception as e:
-            rec.add(probe, f"{label}:{status.value}:ERROR", tx=str(tx_hash), seconds=round(time.time() - t0, 1),
-                    error=f"{type(e).__name__}: {e}")
-            return None
+        rpc_url = "https://rpc-bradbury.genlayer.com"
+        wanted = status.value.upper()
+
+        # Bradbury finalization can take a while, but every individual HTTP
+        # request must have a bounded timeout so the runner cannot hang.
+        max_seconds = 45 * 60 if wanted == "FINALIZED" else 5 * 60
+        deadline = time.time() + max_seconds
+        last_seen = None
+        last_report = 0.0
+        last_error = None
+
+        acceptable = {
+            "ACCEPTED": {"ACCEPTED", "FINALIZED"},
+            "FINALIZED": {"FINALIZED"},
+        }[wanted]
+
+        while time.time() < deadline:
+            try:
+                status_resp = requests.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "gen_getTransactionStatus",
+                        "params": [{"txId": str(tx_hash)}],
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "genlayer-py",
+                    },
+                    timeout=(5, 15),
+                )
+                status_resp.raise_for_status()
+                payload = status_resp.json()
+
+                if payload.get("error"):
+                    raise RuntimeError(f"status RPC error: {payload['error']}")
+
+                info = payload.get("result") or {}
+                seen = str(info.get("status") or "").upper()
+
+                now_ts = time.time()
+                if seen != last_seen or now_ts - last_report >= 30:
+                    print(
+                        f"[{now()}] {probe} {label}: waiting for {wanted}; "
+                        f"network_status={seen or 'UNKNOWN'}"
+                    )
+                    last_seen = seen
+                    last_report = now_ts
+
+                if seen in {"CANCELED", "CANCELLED", "UNDETERMINED"}:
+                    rec.add(
+                        probe,
+                        f"{label}:{wanted}:ERROR",
+                        tx=str(tx_hash),
+                        seconds=round(time.time() - t0, 1),
+                        error=f"terminal network status: {seen}",
+                        status_response=info,
+                    )
+                    return None
+
+                if seen in acceptable:
+                    receipt_resp = requests.post(
+                        rpc_url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "gen_getTransactionReceipt",
+                            "params": [{"txId": str(tx_hash)}],
+                        },
+                        headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "genlayer-py",
+                    },
+                    timeout=(5, 15),
+                    )
+                    receipt_resp.raise_for_status()
+                    receipt_payload = receipt_resp.json()
+
+                    if receipt_payload.get("error"):
+                        raise RuntimeError(
+                            f"receipt RPC error: {receipt_payload['error']}"
+                        )
+
+                    receipt = receipt_payload.get("result")
+                    if receipt is None:
+                        raise RuntimeError("receipt RPC returned null")
+
+                    rec.add(
+                        probe,
+                        f"{label}:{wanted}",
+                        tx=str(tx_hash),
+                        seconds=round(time.time() - t0, 1),
+                        receipt=receipt,
+                    )
+                    return receipt
+
+                last_error = None
+
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                now_ts = time.time()
+                if now_ts - last_report >= 30:
+                    print(
+                        f"[{now()}] {probe} {label}: transient RPC error: "
+                        f"{last_error}"
+                    )
+                    last_report = now_ts
+
+            time.sleep(5)
+
+        rec.add(
+            probe,
+            f"{label}:{wanted}:ERROR",
+            tx=str(tx_hash),
+            seconds=round(time.time() - t0, 1),
+            error=f"timeout waiting for {wanted}; last_error={last_error}",
+        )
+        return None
 
     def write(probe, address, fn, args=None, value=0, final=True):
         try:
-            h = client.write_contract(address=address, function_name=fn, args=args or [], value=value)
+            h = client.write_contract(
+                address=address,
+                function_name=fn,
+                args=args or [],
+                value=value,
+            )
         except Exception as e:
-            rec.add(probe, f"write {fn}:SUBMIT_ERROR", value=str(value), error=f"{type(e).__name__}: {e}",
-                    trace=traceback.format_exc()[-1500:])
+            rec.add(
+                probe,
+                f"write {fn}:SUBMIT_ERROR",
+                value=str(value),
+                error=f"{type(e).__name__}: {e}",
+                trace=traceback.format_exc()[-1500:],
+            )
             return None
-        rec.add(probe, f"write {fn}:submitted", tx=str(h), args=args or [], value=str(value))
-        wait(h, TransactionStatus.ACCEPTED, probe, f"write {fn}")
+
+        rec.add(
+            probe,
+            f"write {fn}:submitted",
+            tx=str(h),
+            args=args or [],
+            value=str(value),
+        )
+
+        accepted = wait(
+            h,
+            TransactionStatus.ACCEPTED,
+            probe,
+            f"write {fn}",
+        )
+        if accepted is None:
+            rec.add(
+                probe,
+                f"write {fn}:NOT_ACCEPTED",
+                tx=str(h),
+            )
+            return None
+
         if final:
-            wait(h, TransactionStatus.FINALIZED, probe, f"write {fn}")
+            finalized = wait(
+                h,
+                TransactionStatus.FINALIZED,
+                probe,
+                f"write {fn}",
+            )
+            if finalized is None:
+                rec.add(
+                    probe,
+                    f"write {fn}:NOT_FINALIZED",
+                    tx=str(h),
+                )
+                return None
+
         return h
 
     def read(probe, address, fn, args=None, label=None):
@@ -192,7 +400,30 @@ def main() -> int:
 
     # ---- L7: records -----------------------------------------------------------
     if want("L7"):
-        write("L7", A, "store", [1, "hello"])
+        existing = read("L7", A, "load", [1], label="load_before_store")
+
+        existing_obj = {}
+        if isinstance(existing, str):
+            try:
+                parsed = json.loads(existing)
+                if isinstance(parsed, dict):
+                    existing_obj = parsed
+            except Exception:
+                pass
+
+        if existing_obj.get("kv") == "hello":
+            rec.add(
+                "L7",
+                "store skipped:already_present",
+                value=existing,
+                records=existing_obj.get("records"),
+                last_i=existing_obj.get("last_i"),
+                last_s=existing_obj.get("last_s"),
+                last_amount=existing_obj.get("last_amount"),
+            )
+        else:
+            write("L7", A, "store", [1, "hello"])
+
         read("L7", A, "load", [1])
 
     # ---- L1: view return shapes (Python side; JS side is l1_genlayer_js.mjs) ---------
@@ -215,30 +446,117 @@ def main() -> int:
         read("L3", A, "balance_now", label="balance_after")
         read("L3", A, "deposits_total")
 
-    # ---- funding for L4 / L5 -----------------------------------------------------------
-    if want("L4") or want("L5"):
-        write("fund", A, "deposit", value=3 * UNIT)
-        read("fund", A, "balance_now", label="balance_after_deposit")
-        read("fund", A, "deposits_total")
-
-    # ---- L5: balance after emit_transfer to an EOA ----------------------------------------
+    # ---- L5: successful emit_transfer to an EOA, isolated on Probe B ------------------
     if want("L5"):
-        read("L5", A, "balance_now", label="balance_before")
-        write("L5", A, "send_to", [recipient, UNIT])
-        poll("L5", "A.balance_now after FINALIZED",
-             lambda: client.read_contract(address=A, function_name="balance_now", args=[]))
+        stage = os.environ.get("PROBE_L5_STAGE", "fund").lower()
 
-    # ---- L4: transfer into a contract without __receive__ -----------------------------------
+        if stage == "fund":
+            read("L5", B, "balance_now", label="B_balance_before_fund")
+            read("L5", B, "deposits_total", label="B_deposits_before_fund")
+
+            if os.environ.get("PROBE_ARM_WRITE") != "YES":
+                rec.add("L5", "stage1_write_guarded")
+                print("L5 fund is READ-ONLY. Set PROBE_ARM_WRITE=YES to submit.")
+                return 0
+
+            print("L5 stage 1: funding Probe B; stopping after ACCEPTED.")
+            h = write("L5", B, "deposit", value=2 * UNIT, final=False)
+            if h is None:
+                print("L5 funding was not accepted.")
+                return 1
+
+            rec.add(
+                "L5",
+                "stage1_funding_submitted",
+                tx=str(h),
+                note="Do not rerun fund stage. Check tx status later.",
+            )
+            print("L5 funding submitted.")
+            return 0
+
+        if stage == "send":
+            read("L5", B, "balance_now", label="B_balance_before_send")
+            read("L5", B, "deposits_total", label="B_deposits_before_send")
+
+            if os.environ.get("PROBE_ARM_WRITE") != "YES":
+                rec.add("L5", "stage2_write_guarded")
+                print("L5 send is READ-ONLY. Set PROBE_ARM_WRITE=YES to submit.")
+                return 0
+
+            print("L5 stage 2: emitting transfer to EOA; stopping after ACCEPTED.")
+            h = write("L5", B, "send_to", [recipient, UNIT], final=False)
+            if h is None:
+                print("L5 transfer was not accepted.")
+                return 1
+
+            rec.add(
+                "L5",
+                "stage2_transfer_submitted",
+                tx=str(h),
+                note="Do not rerun send stage. Check tx later and compare native balance.",
+            )
+            print("L5 transfer submitted.")
+            return 0
+
+        if stage == "read":
+            read("L5", B, "balance_now", label="B_balance_after")
+            read("L5", B, "deposits_total", label="B_deposits_after")
+            return 0
+
+        raise SystemExit(f"Unknown PROBE_L5_STAGE: {stage}")
+
+    # ---- L4: transfer into a contract without __receive__ -----------------------------
     if want("L4"):
+        deposited = read("L4", A, "deposits_total", label="deposits_total_before")
+
+        try:
+            deposited_i = int(deposited)
+        except Exception:
+            deposited_i = 0
+
+        if deposited_i < 3 * UNIT:
+            if os.environ.get("PROBE_ARM_WRITE") != "YES":
+                rec.add("L4", "stage1_write_guarded")
+                print("L4 funding is READ-ONLY. Set PROBE_ARM_WRITE=YES to submit.")
+                return 0
+
+            print("L4 stage 1: submitting funding; stopping after ACCEPTED.")
+            h = write("L4", A, "deposit", value=3 * UNIT, final=False)
+            if h is None:
+                print("L4 funding was not accepted.")
+                return 1
+
+            rec.add(
+                "L4",
+                "stage1_funding_submitted",
+                tx=str(h),
+                note="Do not resubmit funding. Wait for this tx to finalize while running other probes.",
+            )
+            print("L4 funding submitted. Safe to work on another probe now.")
+            return 0
+
         read("L4", A, "balance_now", label="A_balance_before")
         read("L4", B, "balance_now", label="B_balance_before")
-        write("L4", A, "send_to", [B, UNIT])
-        poll("L4", "A.get_bounces after FINALIZED",
-             lambda: client.read_contract(address=A, function_name="get_bounces", args=[]))
-        read("L4", A, "get_bounces")
-        read("L4", A, "bounced_total_str")
-        read("L4", A, "balance_now", label="A_balance_after")
-        read("L4", B, "balance_now", label="B_balance_after")
+
+        if os.environ.get("PROBE_ARM_WRITE") != "YES":
+            rec.add("L4", "stage2_write_guarded")
+            print("L4 transfer is READ-ONLY. Set PROBE_ARM_WRITE=YES to submit.")
+            return 0
+
+        print("L4 stage 2: submitting rejecting emit_transfer; stopping after ACCEPTED.")
+        h = write("L4", A, "send_to", [B, UNIT], final=False)
+        if h is None:
+            print("L4 transfer was not accepted.")
+            return 1
+
+        rec.add(
+            "L4",
+            "stage2_transfer_submitted",
+            tx=str(h),
+            note="Do not rerun L4. Check this tx later, then read bounce state.",
+        )
+        print("L4 transfer submitted. Do not rerun L4 until we inspect its tx.")
+        return 0
 
     # ---- L6: web.get redirect behaviour ----------------------------------------------------
     if want("L6"):
@@ -249,10 +567,28 @@ def main() -> int:
 
     # ---- L8: contract-to-contract message -----------------------------------------------------
     if want("L8"):
-        write("L8", A, "ping", [B])
-        poll("L8", "B.get_pings after FINALIZED",
-             lambda: client.read_contract(address=B, function_name="get_pings", args=[]))
-        read("L8", B, "get_pings")
+        read("L8", B, "get_pings", label="B_pings_before")
+
+        if os.environ.get("PROBE_ARM_WRITE") != "YES":
+            rec.add("L8", "ping_write_guarded")
+            print("L8 ping is READ-ONLY. Set PROBE_ARM_WRITE=YES to submit.")
+            return 0
+
+        print("L8: submitting contract-to-contract ping; stopping after ACCEPTED.")
+        h = write("L8", A, "ping", [B], final=False)
+        if h is None:
+            print("L8 ping was not accepted.")
+            return 1
+
+        rec.add(
+            "L8",
+            "ping_submitted",
+            tx=str(h),
+            note="Do not rerun L8. Check this tx later, then read B.get_pings.",
+        )
+
+        print("L8 ping submitted. Safe to continue other work.")
+        return 0
 
     rec.data["finished_at"] = now()
     rec.flush()
