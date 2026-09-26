@@ -7,12 +7,12 @@ ALLOWED = "raw.githubusercontent.com/Shahin021/Escrow"
 
 URL_A = (
     "https://raw.githubusercontent.com/"
-    "Shahin021/Escrow/main/evidence-a.txt"
+    "Shahin021/Escrow/c0a03dc656df402856f98d8db6c945de4affe35b/evidence-a.txt"
 )
 
 URL_B = (
     "https://raw.githubusercontent.com/"
-    "Shahin021/Escrow/main/evidence-b.txt"
+    "Shahin021/Escrow/c0a03dc656df402856f98d8db6c945de4affe35b/evidence-b.txt"
 )
 
 BAD_URL = (
