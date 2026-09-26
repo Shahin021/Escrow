@@ -246,6 +246,9 @@ class ProjectEscrow(gl.Contract):
     locked: u256
     queued_out: u256
     inflight_out: u256
+    bounced_held: u256
+    unmatched_held: u256
+    unmatched_returns: u256
 
     total_released: u256
     total_refunded: u256
@@ -316,6 +319,9 @@ class ProjectEscrow(gl.Contract):
         self.locked = u256(0)
         self.queued_out = u256(0)
         self.inflight_out = u256(0)
+        self.bounced_held = u256(0)
+        self.unmatched_held = u256(0)
+        self.unmatched_returns = u256(0)
 
         self.total_released = u256(0)
         self.total_refunded = u256(0)
@@ -816,6 +822,95 @@ Respond with ONLY this JSON shape:
         # Revision 1 requires automatic emission when the ledger is idle.
         self._emit_one_queued_outflow()
 
+    @gl.public.write.payable
+    def __on_errored_message__(self) -> None:
+        amount = gl.message.value
+
+        # Only one outflow may be EMITTED at a time.
+        i = 0
+
+        while i < len(self.outflow_statuses):
+            if self.outflow_statuses[i] == "EMITTED":
+                expected = self.outflow_amounts[i]
+
+                if amount == expected:
+                    self.outflow_statuses[i] = "BOUNCED"
+
+                    self.inflight_out = u256(
+                        self.inflight_out - expected
+                    )
+                    self.bounced_held = u256(
+                        self.bounced_held + expected
+                    )
+
+                    return
+
+                break
+
+            i += 1
+
+        # An errored value that cannot be matched to the single
+        # in-flight outflow is never credited to an escrow obligation.
+        self.unmatched_returns = u256(
+            self.unmatched_returns + amount
+        )
+        self.unmatched_held = u256(
+            self.unmatched_held + amount
+        )
+
+    @gl.public.write
+    def redirect_outflow(
+        self,
+        outflow_id: int,
+        to: str,
+    ) -> None:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_statuses)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        if self.outflow_statuses[outflow_id] != "BOUNCED":
+            raise gl.vm.UserError(
+                "outflow is not bounced"
+            )
+
+        kind = self.outflow_kinds[outflow_id]
+
+        if kind == "MILESTONE_PAYOUT":
+            if gl.message.sender_address != self.worker:
+                raise gl.vm.UserError(
+                    "only the worker can redirect this outflow"
+                )
+        else:
+            raise gl.vm.UserError(
+                "unsupported outflow kind"
+            )
+
+        amount = self.outflow_amounts[outflow_id]
+
+        if self.bounced_held < amount:
+            raise gl.vm.UserError(
+                "bounced balance is insufficient"
+            )
+
+        recipient = Address(to)
+
+        self.bounced_held = u256(
+            self.bounced_held - amount
+        )
+        self.queued_out = u256(
+            self.queued_out + amount
+        )
+
+        self.outflow_recipients[outflow_id] = recipient
+        self.outflow_statuses[outflow_id] = "QUEUED"
+        self.outflow_balance_before[outflow_id] = u256(0)
+
+        self._emit_one_queued_outflow()
+
     @gl.public.write
     def emit_next_outflow(self) -> None:
         if self.inflight_out != u256(0):
@@ -929,6 +1024,8 @@ Respond with ONLY this JSON shape:
             self.locked != u256(0)
             or self.queued_out != u256(0)
             or self.inflight_out != u256(0)
+            or self.bounced_held != u256(0)
+            or self.unmatched_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
@@ -1001,6 +1098,9 @@ Respond with ONLY this JSON shape:
             "locked": str(int(self.locked)),
             "queued_out": str(int(self.queued_out)),
             "inflight_out": str(int(self.inflight_out)),
+            "bounced_held": str(int(self.bounced_held)),
+            "unmatched_held": str(int(self.unmatched_held)),
+            "unmatched_returns": str(int(self.unmatched_returns)),
             "released": str(int(self.total_released)),
             "refunded": str(int(self.total_refunded)),
             "sent_total": str(int(self.sent_total)),

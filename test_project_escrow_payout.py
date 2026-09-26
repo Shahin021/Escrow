@@ -134,12 +134,24 @@ def _assert_accounting_identity(escrow):
     a = escrow.get_accounting()
 
     funded = int(a["funded"])
+    unmatched_returns = int(a["unmatched_returns"])
+
     locked = int(a["locked"])
     queued = int(a["queued_out"])
     inflight = int(a["inflight_out"])
+    bounced = int(a["bounced_held"])
+    unmatched = int(a["unmatched_held"])
     sent = int(a["sent_total"])
 
-    assert funded == locked + queued + inflight + sent
+    assert (
+        funded + unmatched_returns
+        == locked
+        + queued
+        + inflight
+        + bounced
+        + unmatched
+        + sent
+    )
 
 
 def test_funding_places_entire_project_into_locked_bucket(
@@ -602,5 +614,190 @@ def test_confirm_rejects_unexplained_balance_mismatch(
     assert escrow.get_milestone_status(0) == "PAYMENT_PENDING"
     assert escrow.get_inflight_out() == str(M1)
     assert escrow.get_total_released() == "0"
+
+    _assert_accounting_identity(escrow)
+
+
+
+def test_bounced_outflow_can_be_redirected_by_worker(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _fund(
+        direct_vm,
+        escrow,
+        direct_owner,
+    )
+
+    _set_contract_balance(
+        direct_vm,
+        TOTAL,
+    )
+
+    _approve(
+        direct_vm,
+        escrow,
+        direct_alice,
+        0,
+        URL_0,
+    )
+
+    direct_vm.sender = direct_alice
+    escrow.claim_payment(0)
+
+    assert escrow.get_outflow_status(0) == "EMITTED"
+    assert escrow.get_inflight_out() == str(M1)
+
+    # Directly exercise the runtime bounce hook.
+    direct_vm.value = M1
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    a = escrow.get_accounting()
+
+    assert escrow.get_outflow_status(0) == "BOUNCED"
+    assert a["inflight_out"] == "0"
+    assert a["bounced_held"] == str(M1)
+    assert a["unmatched_held"] == "0"
+    assert a["unmatched_returns"] == "0"
+
+    _assert_accounting_identity(escrow)
+
+    # Only the worker/beneficiary may redirect this payout.
+    direct_vm.sender = direct_owner
+
+    with direct_vm.expect_revert(
+        "only the worker can redirect this outflow"
+    ):
+        escrow.redirect_outflow(
+            0,
+            _addr(direct_bob),
+        )
+
+    assert escrow.get_outflow_status(0) == "BOUNCED"
+
+    # Worker redirects to a new EOA.
+    direct_vm.sender = direct_alice
+
+    escrow.redirect_outflow(
+        0,
+        _addr(direct_bob),
+    )
+
+    a = escrow.get_accounting()
+
+    assert escrow.get_outflow_status(0) == "EMITTED"
+    assert escrow.get_outflow_recipient(0) == _addr(direct_bob)
+    assert a["bounced_held"] == "0"
+    assert a["queued_out"] == "0"
+    assert a["inflight_out"] == str(M1)
+
+    _assert_accounting_identity(escrow)
+
+
+def test_unmatched_errored_value_is_held_separately(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _fund(
+        direct_vm,
+        escrow,
+        direct_owner,
+    )
+
+    unexpected = 77
+
+    direct_vm.value = unexpected
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    a = escrow.get_accounting()
+
+    assert a["unmatched_returns"] == str(unexpected)
+    assert a["unmatched_held"] == str(unexpected)
+    assert a["bounced_held"] == "0"
+    assert a["inflight_out"] == "0"
+
+    # Unexpected value must not unlock or credit a milestone.
+    assert a["locked"] == str(TOTAL)
+    assert escrow.get_milestone_status(0) == "AWAITING_DELIVERY"
+
+    _assert_accounting_identity(escrow)
+
+
+def test_wrong_bounce_amount_does_not_consume_inflight_outflow(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _fund(
+        direct_vm,
+        escrow,
+        direct_owner,
+    )
+
+    _set_contract_balance(
+        direct_vm,
+        TOTAL,
+    )
+
+    _approve(
+        direct_vm,
+        escrow,
+        direct_alice,
+        0,
+        URL_0,
+    )
+
+    direct_vm.sender = direct_alice
+    escrow.claim_payment(0)
+
+    direct_vm.value = M1 - 1
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    a = escrow.get_accounting()
+
+    # The actual payout is still in flight.
+    assert escrow.get_outflow_status(0) == "EMITTED"
+    assert a["inflight_out"] == str(M1)
+
+    # The unrelated errored value is isolated.
+    assert a["unmatched_returns"] == str(M1 - 1)
+    assert a["unmatched_held"] == str(M1 - 1)
+    assert a["bounced_held"] == "0"
 
     _assert_accounting_identity(escrow)
