@@ -19,6 +19,15 @@ from genlayer.py.keccak import Keccak256
 import json
 
 
+@gl.evm.contract_interface
+class EoaRecipient:
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
 MAX_MILESTONES = 16
 MAX_SPEC_CHARS = 4000
 MAX_MILESTONES_JSON_CHARS = 32000
@@ -223,10 +232,24 @@ class ProjectEscrow(gl.Contract):
     attempt_verdicts: DynArray[str]
     attempt_reasons: DynArray[str]
 
+    outflow_kinds: DynArray[str]
+    outflow_milestones: DynArray[u32]
+    outflow_recipients: DynArray[Address]
+    outflow_amounts: DynArray[u256]
+    outflow_statuses: DynArray[str]
+    outflow_balance_before: DynArray[u256]
+
     total_required: u256
     total_funded: u256
+
+    # Internal ledger. These buckets are authoritative for obligations.
+    locked: u256
+    queued_out: u256
+    inflight_out: u256
+
     total_released: u256
     total_refunded: u256
+    sent_total: u256
 
     active_milestone: u32
 
@@ -289,8 +312,14 @@ class ProjectEscrow(gl.Contract):
 
         self.total_required = u256(0)
         self.total_funded = u256(0)
+
+        self.locked = u256(0)
+        self.queued_out = u256(0)
+        self.inflight_out = u256(0)
+
         self.total_released = u256(0)
         self.total_refunded = u256(0)
+        self.sent_total = u256(0)
 
         self.active_milestone = u32(0)
 
@@ -349,6 +378,8 @@ class ProjectEscrow(gl.Contract):
             )
 
         self.total_funded = u256(self.total_required)
+        self.locked = u256(self.total_required)
+
         self.project_status = "ACTIVE"
         self.active_milestone = u32(0)
         self.milestone_statuses[0] = "AWAITING_DELIVERY"
@@ -698,6 +729,227 @@ Respond with ONLY this JSON shape:
                 milestone_index
             ] = "REVISION_REQUIRED"
 
+    def _emit_one_queued_outflow(self):
+        # Only one native-value outflow may be in flight at a time.
+        if self.inflight_out != u256(0):
+            return False
+
+        i = 0
+
+        while i < len(self.outflow_statuses):
+            if self.outflow_statuses[i] == "QUEUED":
+                amount = self.outflow_amounts[i]
+
+                # This is an operational safety check only.
+                # Native balance is NOT the accounting source of truth.
+                if self.balance < amount:
+                    raise gl.vm.UserError(
+                        "native balance is insufficient to emit outflow"
+                    )
+
+                before = self.balance
+
+                # Lock state BEFORE the external transfer is scheduled.
+                self.outflow_statuses[i] = "EMITTED"
+                self.outflow_balance_before[i] = before
+
+                self.queued_out = u256(
+                    self.queued_out - amount
+                )
+                self.inflight_out = u256(
+                    self.inflight_out + amount
+                )
+
+                EoaRecipient(
+                    self.outflow_recipients[i]
+                ).emit_transfer(
+                    value=amount
+                )
+
+                return True
+
+            i += 1
+
+        return False
+
+    @gl.public.write
+    def claim_payment(self, milestone_index: int) -> None:
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError(
+                "only the worker can claim payment"
+            )
+
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "APPROVED":
+            raise gl.vm.UserError(
+                "milestone is not approved for payment"
+            )
+
+        amount = self.milestone_amounts[milestone_index]
+
+        if self.locked < amount:
+            raise gl.vm.UserError(
+                "internal locked balance is insufficient"
+            )
+
+        # Move exactly this milestone amount out of locked obligations.
+        self.locked = u256(self.locked - amount)
+        self.queued_out = u256(self.queued_out + amount)
+
+        outflow_id = u32(len(self.outflow_statuses))
+
+        self.outflow_kinds.append("MILESTONE_PAYOUT")
+        self.outflow_milestones.append(
+            u32(milestone_index)
+        )
+        self.outflow_recipients.append(self.worker)
+        self.outflow_amounts.append(amount)
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        # Double claim is impossible after this transition.
+        self.milestone_statuses[
+            milestone_index
+        ] = "PAYMENT_PENDING"
+
+        # Revision 1 requires automatic emission when the ledger is idle.
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
+    def emit_next_outflow(self) -> None:
+        if self.inflight_out != u256(0):
+            raise gl.vm.UserError(
+                "another outflow is already in flight"
+            )
+
+        if not self._emit_one_queued_outflow():
+            raise gl.vm.UserError(
+                "there is no queued outflow"
+            )
+
+    @gl.public.write
+    def confirm_outflow(self, outflow_id: int) -> None:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_statuses)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        if self.outflow_statuses[outflow_id] != "EMITTED":
+            raise gl.vm.UserError(
+                "outflow is not emitted"
+            )
+
+        amount = self.outflow_amounts[outflow_id]
+        before = self.outflow_balance_before[outflow_id]
+
+        if before < amount:
+            raise gl.vm.UserError(
+                "invalid outflow balance baseline"
+            )
+
+        expected_after = u256(before - amount)
+
+        # Confirm an exact native-balance drop of this outflow amount.
+        # Pre-existing unmatched surplus is tolerated because it is already
+        # included in `before`; unexplained extra loss is never accepted.
+        if self.balance == before:
+            raise gl.vm.UserError(
+                "outflow has not completed yet"
+            )
+
+        if self.balance != expected_after:
+            raise gl.vm.UserError(
+                "outflow balance mismatch"
+            )
+
+        kind = self.outflow_kinds[outflow_id]
+
+        if kind != "MILESTONE_PAYOUT":
+            raise gl.vm.UserError(
+                "unsupported outflow kind"
+            )
+
+        milestone_index = int(
+            self.outflow_milestones[outflow_id]
+        )
+
+        if (
+            self.milestone_statuses[milestone_index]
+            != "PAYMENT_PENDING"
+        ):
+            raise gl.vm.UserError(
+                "milestone is not payment pending"
+            )
+
+        # Confirm exactly once.
+        self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+        self.inflight_out = u256(
+            self.inflight_out - amount
+        )
+        self.sent_total = u256(
+            self.sent_total + amount
+        )
+        self.total_released = u256(
+            self.total_released + amount
+        )
+
+        self.milestone_statuses[
+            milestone_index
+        ] = "RELEASED"
+
+        next_index = milestone_index + 1
+
+        if next_index < len(self.milestone_statuses):
+            self.active_milestone = u32(next_index)
+            self.milestone_statuses[
+                next_index
+            ] = "AWAITING_DELIVERY"
+        else:
+            # No work remains. Project closure is explicit so that later
+            # settlement/refund outflows can use the same rule.
+            self.project_status = "SETTLING"
+
+        # Future phases may queue multiple serialized outflows.
+        # If one already exists, emit it after confirming this one.
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
+    def close_project(self) -> None:
+        if self.project_status != "SETTLING":
+            raise gl.vm.UserError(
+                "project is not settling"
+            )
+
+        if (
+            self.locked != u256(0)
+            or self.queued_out != u256(0)
+            or self.inflight_out != u256(0)
+        ):
+            raise gl.vm.UserError(
+                "project still has unsettled obligations"
+            )
+
+        i = 0
+
+        while i < len(self.milestone_statuses):
+            if self.milestone_statuses[i] not in (
+                "RELEASED",
+                "REFUNDED",
+                "CANCELLED",
+            ):
+                raise gl.vm.UserError(
+                    "project has a non-terminal milestone"
+                )
+
+            i += 1
+
+        self.project_status = "CLOSED"
+
     @gl.public.view
     def get_project_status(self) -> str:
         return self.project_status
@@ -719,12 +971,92 @@ Respond with ONLY this JSON shape:
         return str(int(self.total_funded))
 
     @gl.public.view
+    def get_locked(self) -> str:
+        return str(int(self.locked))
+
+    @gl.public.view
+    def get_queued_out(self) -> str:
+        return str(int(self.queued_out))
+
+    @gl.public.view
+    def get_inflight_out(self) -> str:
+        return str(int(self.inflight_out))
+
+    @gl.public.view
     def get_total_released(self) -> str:
         return str(int(self.total_released))
 
     @gl.public.view
     def get_total_refunded(self) -> str:
         return str(int(self.total_refunded))
+
+    @gl.public.view
+    def get_sent_total(self) -> str:
+        return str(int(self.sent_total))
+
+    @gl.public.view
+    def get_accounting(self) -> dict:
+        return {
+            "funded": str(int(self.total_funded)),
+            "locked": str(int(self.locked)),
+            "queued_out": str(int(self.queued_out)),
+            "inflight_out": str(int(self.inflight_out)),
+            "released": str(int(self.total_released)),
+            "refunded": str(int(self.total_refunded)),
+            "sent_total": str(int(self.sent_total)),
+        }
+
+    @gl.public.view
+    def get_outflow_count(self) -> u32:
+        return u32(len(self.outflow_statuses))
+
+    @gl.public.view
+    def get_outflow_status(self, outflow_id: int) -> str:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_statuses)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        return self.outflow_statuses[outflow_id]
+
+    @gl.public.view
+    def get_outflow_amount(self, outflow_id: int) -> str:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_amounts)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        return str(int(self.outflow_amounts[outflow_id]))
+
+    @gl.public.view
+    def get_outflow_milestone(self, outflow_id: int) -> u32:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_milestones)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        return self.outflow_milestones[outflow_id]
+
+    @gl.public.view
+    def get_outflow_recipient(self, outflow_id: int) -> str:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_recipients)
+        ):
+            raise gl.vm.UserError(
+                "outflow index out of range"
+            )
+
+        return str(self.outflow_recipients[outflow_id])
 
     @gl.public.view
     def get_milestone_spec(self, index: int) -> str:
