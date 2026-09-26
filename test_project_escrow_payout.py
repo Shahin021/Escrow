@@ -699,7 +699,10 @@ def test_bounced_outflow_can_be_redirected_by_worker(
     a = escrow.get_accounting()
 
     assert escrow.get_outflow_status(0) == "EMITTED"
-    assert escrow.get_outflow_recipient(0) == _addr(direct_bob)
+    assert (
+        escrow.get_outflow_recipient(0).lower()
+        == _addr(direct_bob).lower()
+    )
     assert a["bounced_held"] == "0"
     assert a["queued_out"] == "0"
     assert a["inflight_out"] == str(M1)
