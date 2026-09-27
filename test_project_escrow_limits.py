@@ -78,7 +78,7 @@ def _mock_unavailable(direct_vm):
     )
 
 
-def test_allows_at_most_ten_milestones(
+def test_allows_ten_milestones(
     direct_vm,
     direct_deploy,
     direct_owner,
@@ -94,6 +94,13 @@ def test_allows_at_most_ten_milestones(
 
     assert int(escrow.get_milestone_count()) == 10
 
+
+def test_rejects_more_than_ten_milestones(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
     with direct_vm.expect_revert("too many milestones"):
         _deploy(
             direct_vm,
