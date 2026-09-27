@@ -116,7 +116,7 @@ def _approve(
         r".*",
         json.dumps(
             {
-                "approved": True,
+                "criteria": [True],
                 "reason": "Evidence satisfies the milestone.",
             }
         ),

@@ -120,10 +120,13 @@ def _mock_web(direct_vm, status, body=""):
     )
 
 
-def _mock_llm(direct_vm, approved, reason):
+def _mock_llm(direct_vm, approved, reason, criteria_count=1):
+    # Phase 2 schema: the model returns one boolean per stored criterion and
+    # never an "approved" field. These milestones carry the implicit N = 1
+    # criterion, so a single boolean expresses the old whole-spec verdict.
     raw = json.dumps(
         {
-            "approved": approved,
+            "criteria": [approved] * criteria_count,
             "reason": reason,
         }
     )
@@ -306,11 +309,11 @@ def test_malformed_boolean_reverts_without_state_change(
 
     direct_vm.mock_llm(
         r".*",
-        '{"approved":"false","reason":"malformed boolean"}',
+        '{"criteria":["false"],"reason":"malformed boolean"}',
     )
 
     with direct_vm.expect_revert(
-        "approved must be a JSON boolean"
+        "criteria entries must be JSON booleans"
     ):
         escrow.resolve(0)
 
@@ -476,7 +479,7 @@ def test_oversized_model_output_reverts_without_state_change(
     direct_vm.mock_llm(
         r".*",
         (
-            '{"approved": true, "reason": "'
+            '{"criteria": [true], "reason": "'
             + ("x" * 2100)
             + '"}'
         ),
@@ -512,7 +515,7 @@ def test_overlong_reason_reverts_without_state_change(
         r".*",
         json.dumps(
             {
-                "approved": True,
+                "criteria": [True],
                 "reason": "x" * 301,
             }
         ),
