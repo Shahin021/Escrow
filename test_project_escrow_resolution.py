@@ -420,3 +420,148 @@ def test_branch_url_is_rejected_before_attempt_creation(
         == "AWAITING_DELIVERY"
     )
     assert int(escrow.get_attempt_count(0)) == 0
+
+
+def test_oversized_evidence_becomes_unavailable_without_llm(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _prepare(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    # MAX_EVIDENCE_BYTES = 12000 * 4.
+    # Deliberately no LLM mock: oversized evidence must never reach it.
+    _mock_web(
+        direct_vm,
+        200,
+        "x" * 48001,
+    )
+
+    escrow.resolve(0)
+
+    assert (
+        escrow.get_milestone_status(0)
+        == "EVIDENCE_UNAVAILABLE"
+    )
+    assert escrow.get_attempt_verdict(0) == "UNAVAILABLE"
+    assert (
+        escrow.get_attempt_reason(0)
+        == "artifact exceeds evidence size limit"
+    )
+    assert escrow.get_attempt_evidence_hash(0) == ""
+    assert escrow.get_attempt_excerpt(0) == ""
+
+
+def test_oversized_model_output_reverts_without_state_change(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _prepare(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _mock_web(direct_vm, 200, EVIDENCE_A)
+
+    direct_vm.mock_llm(
+        r".*",
+        (
+            '{"approved": true, "reason": "'
+            + ("x" * 2100)
+            + '"}'
+        ),
+    )
+
+    with direct_vm.expect_revert(
+        "adjudicator output is too large"
+    ):
+        escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "UNDER_REVIEW"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+    assert escrow.get_attempt_verdict(0) == "PENDING"
+    assert escrow.get_attempt_evidence_hash(0) == ""
+
+
+def test_overlong_reason_reverts_without_state_change(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _prepare(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _mock_web(direct_vm, 200, EVIDENCE_A)
+
+    direct_vm.mock_llm(
+        r".*",
+        json.dumps(
+            {
+                "approved": True,
+                "reason": "x" * 301,
+            }
+        ),
+    )
+
+    with direct_vm.expect_revert(
+        "adjudicator reason is too long"
+    ):
+        escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "UNDER_REVIEW"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+    assert escrow.get_attempt_verdict(0) == "PENDING"
+    assert escrow.get_attempt_evidence_hash(0) == ""
+
+
+def test_known_keccak_vector_is_recorded_for_short_evidence(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _deploy(
+        direct_vm,
+        direct_deploy,
+        direct_owner,
+        direct_alice,
+    )
+
+    _fund(direct_vm, escrow, direct_owner)
+
+    direct_vm.sender = direct_alice
+    escrow.submit_deliverable(
+        0,
+        PINNED_URL,
+        "keccak vector",
+    )
+
+    # Short evidence exits before the LLM call but only after hashing.
+    _mock_web(direct_vm, 200, "abc")
+
+    escrow.resolve(0)
+
+    assert (
+        escrow.get_milestone_status(0)
+        == "EVIDENCE_UNAVAILABLE"
+    )
+    assert (
+        escrow.get_attempt_evidence_hash(0)
+        == "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+    )
+    assert escrow.get_attempt_excerpt(0) == "abc"

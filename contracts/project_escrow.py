@@ -46,9 +46,11 @@ MAX_ATTEMPTS_PER_MILESTONE = 20
 MAX_ATTEMPTS_TOTAL = 200
 
 MAX_EVIDENCE_CHARS = 12000
+MAX_EVIDENCE_BYTES = MAX_EVIDENCE_CHARS * 4
 MIN_EVIDENCE_CHARS = 40
 MAX_EXCERPT_CHARS = 300
 MAX_REASON_CHARS = 300
+MAX_MODEL_OUTPUT_CHARS = 2000
 
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
@@ -186,6 +188,11 @@ def _parse_verdict(raw):
     else:
         cleaned = str(raw).strip()
 
+        if len(cleaned) > MAX_MODEL_OUTPUT_CHARS:
+            raise gl.vm.UserError(
+                "adjudicator output is too large"
+            )
+
         try:
             data = json.loads(cleaned)
         except Exception:
@@ -196,6 +203,11 @@ def _parse_verdict(raw):
     if not isinstance(data, dict):
         raise gl.vm.UserError(
             "adjudicator must return a JSON object"
+        )
+
+    if set(data.keys()) != {"approved", "reason"}:
+        raise gl.vm.UserError(
+            "adjudicator returned unexpected fields"
         )
 
     approved = data.get("approved")
@@ -212,7 +224,14 @@ def _parse_verdict(raw):
             "adjudicator reason must be a non-empty string"
         )
 
-    return approved, reason.strip()[:MAX_REASON_CHARS]
+    reason = reason.strip()
+
+    if len(reason) > MAX_REASON_CHARS:
+        raise gl.vm.UserError(
+            "adjudicator reason is too long"
+        )
+
+    return approved, reason
 
 
 class ProjectEscrow(gl.Contract):
@@ -644,10 +663,39 @@ class ProjectEscrow(gl.Contract):
             body = response.body
 
             if isinstance(body, str):
+                if len(body) > MAX_EVIDENCE_BYTES:
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": "artifact exceeds evidence size limit",
+                        "evidence_hash": "",
+                        "excerpt": "",
+                    }
+
                 body_bytes = body.encode("utf-8")
+
+                if len(body_bytes) > MAX_EVIDENCE_BYTES:
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": "artifact exceeds evidence size limit",
+                        "evidence_hash": "",
+                        "excerpt": "",
+                    }
+
                 raw_text = body
             else:
                 body_bytes = bytes(body)
+
+                if len(body_bytes) > MAX_EVIDENCE_BYTES:
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": "artifact exceeds evidence size limit",
+                        "evidence_hash": "",
+                        "excerpt": "",
+                    }
+
                 raw_text = body_bytes.decode(
                     "utf-8",
                     errors="replace",
