@@ -52,6 +52,25 @@ MAX_EXCERPT_CHARS = 300
 MAX_REASON_CHARS = 300
 MAX_MODEL_OUTPUT_CHARS = 2000
 
+# Phase 2 adjudication rubric.
+#
+# Adjudication authority: when a milestone defines explicit criteria, the
+# required criteria are the authoritative payment conditions. The milestone
+# spec stays trusted descriptive context for the reviewer and is never an
+# independent approval condition. A milestone without explicit criteria is
+# stored as the single implicit criterion below, so Phase 1 whole-spec
+# semantics are exactly the N = 1 case of Phase 2.
+MAX_CRITERIA_PER_MILESTONE = 6
+MIN_CRITERION_CHARS = 10
+MAX_CRITERION_CHARS = 200
+MAX_CRITERIA_TOTAL = MAX_MILESTONES * MAX_CRITERIA_PER_MILESTONE
+RUBRIC_VERSION = "v2"
+
+IMPLICIT_CRITERION_TEXT = (
+    "The retrieved evidence demonstrates every required element of the "
+    "agreed milestone specification."
+)
+
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
 
@@ -182,6 +201,126 @@ def _evidence_hash(raw):
     return Keccak256(data).hexdigest()
 
 
+def _normalize_criterion(raw):
+    """Stored form of a criterion: stripped, no C0 control characters or DEL.
+
+    Order matters. Control characters and UTF-8 encodability are checked on
+    the raw string, before stripping, so a leading or trailing tab, CR or LF
+    cannot disappear before validation. UTF-8 encodability is a construction
+    requirement because _rubric_hash encodes the stored text as UTF-8; a lone
+    surrogate must fail here, not later inside a hash or a view.
+    """
+    if not isinstance(raw, str):
+        raise gl.vm.UserError("criterion text must be a string")
+
+    for ch in raw:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise gl.vm.UserError(
+                "criterion text must not contain control characters"
+            )
+
+    try:
+        raw.encode("utf-8")
+    except Exception:
+        raise gl.vm.UserError(
+            "criterion text must be valid UTF-8 text"
+        )
+
+    text = raw.strip()
+
+    if len(text) < MIN_CRITERION_CHARS:
+        raise gl.vm.UserError("criterion text is too short")
+
+    if len(text) > MAX_CRITERION_CHARS:
+        raise gl.vm.UserError("criterion text is too long")
+
+    return text
+
+
+def _criterion_dedup_key(text):
+    """Comparison form used only for duplicate detection."""
+    return " ".join(text.split()).casefold()
+
+
+def _parse_criteria(raw_criteria):
+    """Validate one milestone's criteria list.
+
+    Returns (texts, required_mask). The mask is a string of "1"/"0" rather
+    than DynArray[bool]: bool has never been used as a storage element type
+    in this contract or verified by a Bradbury probe.
+    """
+    if not isinstance(raw_criteria, list):
+        raise gl.vm.UserError("milestone criteria must be a JSON array")
+
+    if len(raw_criteria) == 0:
+        raise gl.vm.UserError("milestone criteria cannot be empty")
+
+    if len(raw_criteria) > MAX_CRITERIA_PER_MILESTONE:
+        raise gl.vm.UserError("too many criteria for one milestone")
+
+    texts = []
+    mask_parts = []
+    seen = []
+
+    for entry in raw_criteria:
+        if not isinstance(entry, dict):
+            raise gl.vm.UserError("each criterion must be a JSON object")
+
+        if set(entry.keys()) != {"text", "required"}:
+            raise gl.vm.UserError("criterion has unexpected fields")
+
+        required = entry.get("required")
+
+        if required is not True and required is not False:
+            raise gl.vm.UserError("criterion required must be a JSON boolean")
+
+        text = _normalize_criterion(entry.get("text"))
+        key = _criterion_dedup_key(text)
+
+        if key in seen:
+            raise gl.vm.UserError("duplicate criterion in milestone")
+
+        seen.append(key)
+        texts.append(text)
+        mask_parts.append("1" if required else "0")
+
+    mask = "".join(mask_parts)
+
+    if "1" not in mask:
+        raise gl.vm.UserError(
+            "milestone needs at least one required criterion"
+        )
+
+    return texts, mask
+
+
+def _rubric_hash(texts, mask, spec):
+    """Rubric identity.
+
+    Canonical object, compact separators, sorted keys, UTF-8, Keccak-256:
+    {"criteria": [...], "required_mask": "...", "rubric_version": "v2",
+     "spec": "..."}
+
+    The stored specification is part of the identity. Without it, two
+    milestones that both fall back to the generic implicit criterion would
+    hash identically despite requiring different work, and the spec stays
+    trusted reviewer context for explicit criteria too.
+    """
+    canonical = json.dumps(
+        {
+            "criteria": list(texts),
+            "required_mask": mask,
+            "rubric_version": RUBRIC_VERSION,
+            "spec": spec,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    return Keccak256(canonical.encode("utf-8")).hexdigest()
+
+
 def _parse_verdict(raw):
     if isinstance(raw, dict):
         try:
@@ -268,6 +407,14 @@ class ProjectEscrow(gl.Contract):
     milestone_current_attempt: DynArray[u32]
     milestone_attempt_counts: DynArray[u32]
     milestone_stall_free_used: DynArray[u32]
+
+    # Phase 2 rubric. criterion_texts is a flat array; each milestone owns the
+    # slice [start, start + count). No second milestone->criterion mapping is
+    # stored, so there is only one invariant to keep.
+    criterion_texts: DynArray[str]
+    milestone_criteria_start: DynArray[u32]
+    milestone_criteria_count: DynArray[u32]
+    milestone_required_mask: DynArray[str]
 
     attempt_milestones: DynArray[u32]
     attempt_urls: DynArray[str]
@@ -406,6 +553,17 @@ class ProjectEscrow(gl.Contract):
             if len(spec) > MAX_SPEC_CHARS:
                 raise gl.vm.UserError("milestone spec is too long")
 
+            # The stored spec is part of the rubric hash, which encodes its
+            # canonical object as UTF-8. A lone surrogate survives JSON
+            # decoding but has no UTF-8 encoding, so it must fail here rather
+            # than inside a later hash, view or consensus comparison.
+            try:
+                spec.encode("utf-8")
+            except Exception:
+                raise gl.vm.UserError(
+                    "milestone spec must be valid UTF-8 text"
+                )
+
             if not isinstance(amount_raw, str):
                 raise gl.vm.UserError("milestone amount must be a decimal string")
 
@@ -432,6 +590,37 @@ class ProjectEscrow(gl.Contract):
 
             if amount == u256(0):
                 raise gl.vm.UserError("milestone amount must be positive")
+
+            # The implicit N = 1 fallback applies only when the key is
+            # absent. An explicit "criteria": null is a malformed value and
+            # is rejected by _parse_criteria as a non-array.
+            if "criteria" not in raw:
+                criterion_texts = [IMPLICIT_CRITERION_TEXT]
+                required_mask = "1"
+            else:
+                criterion_texts, required_mask = _parse_criteria(
+                    raw["criteria"]
+                )
+
+            # Defense in depth. With MAX_MILESTONES = 10 and
+            # MAX_CRITERIA_PER_MILESTONE = 6 this cannot trigger today; it
+            # keeps the bound explicit if either constant changes.
+            if (
+                len(self.criterion_texts) + len(criterion_texts)
+                > MAX_CRITERIA_TOTAL
+            ):
+                raise gl.vm.UserError("too many criteria in project")
+
+            self.milestone_criteria_start.append(
+                u32(len(self.criterion_texts))
+            )
+            self.milestone_criteria_count.append(
+                u32(len(criterion_texts))
+            )
+            self.milestone_required_mask.append(required_mask)
+
+            for criterion_text in criterion_texts:
+                self.criterion_texts.append(criterion_text)
 
             self.milestone_specs.append(spec)
             self.milestone_amounts.append(amount)
@@ -486,6 +675,15 @@ class ProjectEscrow(gl.Contract):
 
         if index != int(self.active_milestone):
             raise gl.vm.UserError("milestone is not active")
+
+    def _milestone_criteria(self, index):
+        start = int(self.milestone_criteria_start[index])
+        count = int(self.milestone_criteria_count[index])
+
+        return [
+            self.criterion_texts[start + offset]
+            for offset in range(count)
+        ]
 
     def _append_attempt(self, index, url, notes, kind):
         if len(notes) > MAX_NOTES_CHARS:
@@ -1295,6 +1493,48 @@ Respond with ONLY this JSON shape:
         if index < 0 or index >= len(self.milestone_specs):
             raise gl.vm.UserError("milestone index out of range")
         return self.milestone_specs[index]
+
+    @gl.public.view
+    def get_milestone_criteria_count(self, index: int) -> u32:
+        if index < 0 or index >= len(self.milestone_criteria_count):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_criteria_count[index]
+
+    @gl.public.view
+    def get_milestone_required_mask(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_required_mask):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_required_mask[index]
+
+    @gl.public.view
+    def get_criterion_text(self, index: int, position: int) -> str:
+        if index < 0 or index >= len(self.milestone_criteria_count):
+            raise gl.vm.UserError("milestone index out of range")
+
+        count = int(self.milestone_criteria_count[index])
+
+        if position < 0 or position >= count:
+            raise gl.vm.UserError("criterion position out of range")
+
+        start = int(self.milestone_criteria_start[index])
+
+        return self.criterion_texts[start + position]
+
+    @gl.public.view
+    def get_milestone_rubric_hash(self, index: int) -> str:
+        """Rubric identity, reproducible by an external auditor."""
+        if index < 0 or index >= len(self.milestone_criteria_count):
+            raise gl.vm.UserError("milestone index out of range")
+
+        return _rubric_hash(
+            self._milestone_criteria(index),
+            self.milestone_required_mask[index],
+            self.milestone_specs[index],
+        )
+
+    @gl.public.view
+    def get_rubric_version(self) -> str:
+        return RUBRIC_VERSION
 
     @gl.public.view
     def get_milestone_amount(self, index: int) -> str:
