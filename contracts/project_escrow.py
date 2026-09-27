@@ -184,6 +184,22 @@ def _evidence_hash(raw):
 
 def _parse_verdict(raw):
     if isinstance(raw, dict):
+        try:
+            encoded = json.dumps(
+                raw,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except Exception:
+            raise gl.vm.UserError(
+                "adjudicator output must be JSON serializable"
+            )
+
+        if len(encoded) > MAX_MODEL_OUTPUT_CHARS:
+            raise gl.vm.UserError(
+                "adjudicator output is too large"
+            )
+
         data = raw
     else:
         cleaned = str(raw).strip()
