@@ -296,3 +296,81 @@ def test_attempt_log_stops_at_twenty_per_milestone(
         escrow.get_milestone_status(0)
         == "EVIDENCE_UNAVAILABLE"
     )
+
+
+def test_rejects_same_client_and_worker(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+):
+    direct_vm.sender = direct_owner
+
+    with direct_vm.expect_revert(
+        "client and worker must be different"
+    ):
+        direct_deploy(
+            CONTRACT,
+            _addr(direct_owner),
+            _milestones(),
+            ALLOWED,
+            "text",
+            3,
+            False,
+        )
+
+
+def test_rejects_max_revisions_above_attempt_cap(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    direct_vm.sender = direct_owner
+
+    with direct_vm.expect_revert(
+        "max_revisions exceeds milestone attempt limit"
+    ):
+        direct_deploy(
+            CONTRACT,
+            _addr(direct_alice),
+            _milestones(),
+            ALLOWED,
+            "text",
+            21,
+            False,
+        )
+
+
+def test_rejects_total_required_above_u256(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    direct_vm.sender = direct_owner
+
+    milestones = json.dumps(
+        [
+            {
+                "spec": "Maximum-value milestone.",
+                "amount": str(MAX_U256),
+            },
+            {
+                "spec": "Overflowing second milestone.",
+                "amount": "1",
+            },
+        ]
+    )
+
+    with direct_vm.expect_revert(
+        "total required exceeds u256"
+    ):
+        direct_deploy(
+            CONTRACT,
+            _addr(direct_alice),
+            milestones,
+            ALLOWED,
+            "text",
+            3,
+            False,
+        )

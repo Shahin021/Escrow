@@ -336,6 +336,11 @@ class ProjectEscrow(gl.Contract):
         if max_revisions < 1:
             raise gl.vm.UserError("max_revisions must be at least 1")
 
+        if max_revisions > MAX_ATTEMPTS_PER_MILESTONE:
+            raise gl.vm.UserError(
+                "max_revisions exceeds milestone attempt limit"
+            )
+
         try:
             raw_milestones = json.loads(milestones_json)
         except Exception:
@@ -350,8 +355,15 @@ class ProjectEscrow(gl.Contract):
         if len(raw_milestones) > MAX_MILESTONES:
             raise gl.vm.UserError("too many milestones")
 
+        worker_address = Address(worker)
+
+        if worker_address == gl.message.sender_address:
+            raise gl.vm.UserError(
+                "client and worker must be different"
+            )
+
         self.client = gl.message.sender_address
-        self.worker = Address(worker)
+        self.worker = worker_address
 
         self.allowed_sources = ",".join(sources)
         self.render_mode = render_mode
@@ -415,7 +427,8 @@ class ProjectEscrow(gl.Contract):
                     "milestone amount exceeds u256"
                 )
 
-            amount = u256(int(normalized_amount))
+            amount_int = int(normalized_amount)
+            amount = u256(amount_int)
 
             if amount == u256(0):
                 raise gl.vm.UserError("milestone amount must be positive")
@@ -428,7 +441,17 @@ class ProjectEscrow(gl.Contract):
             self.milestone_attempt_counts.append(u32(0))
             self.milestone_stall_free_used.append(u32(0))
 
-            self.total_required = u256(self.total_required + amount)
+            if (
+                int(self.total_required)
+                > int(MAX_U256_DECIMAL) - amount_int
+            ):
+                raise gl.vm.UserError(
+                    "total required exceeds u256"
+                )
+
+            self.total_required = u256(
+                int(self.total_required) + amount_int
+            )
 
     @gl.public.write.payable
     def fund(self) -> None:
