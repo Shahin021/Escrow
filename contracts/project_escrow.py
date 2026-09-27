@@ -28,13 +28,23 @@ class EoaRecipient:
         pass
 
 
-MAX_MILESTONES = 16
+MAX_MILESTONES = 10
 MAX_SPEC_CHARS = 4000
 MAX_MILESTONES_JSON_CHARS = 32000
 MAX_SOURCES_CHARS = 2000
 MAX_SOURCES = 8
 MAX_URL_CHARS = 400
 MAX_NOTES_CHARS = 500
+
+MAX_AMOUNT_DIGITS = 78
+MAX_U256_DECIMAL = (
+    "115792089237316195423570985008687907853269984665640564"
+    "039457584007913129639935"
+)
+
+MAX_ATTEMPTS_PER_MILESTONE = 20
+MAX_ATTEMPTS_TOTAL = 200
+
 MAX_EVIDENCE_CHARS = 12000
 MIN_EVIDENCE_CHARS = 40
 MAX_EXCERPT_CHARS = 300
@@ -116,12 +126,14 @@ def _normalize_evidence(raw):
 
 
 def _check_pinned_url(url, allowed_raw):
-    canonical = _check_url(url, allowed_raw)
+    raw = url.strip()
 
-    if "?" in canonical or "#" in canonical:
+    if "?" in raw or "#" in raw:
         raise gl.vm.UserError(
             "pinned artifact url must not contain query or fragment"
         )
+
+    canonical = _check_url(raw, allowed_raw)
 
     parts = canonical[len(_HTTPS):].split("/")
 
@@ -353,7 +365,22 @@ class ProjectEscrow(gl.Contract):
             if len(amount_raw) == 0 or not amount_raw.isdigit():
                 raise gl.vm.UserError("milestone amount must be a decimal string")
 
-            amount = u256(int(amount_raw))
+            if len(amount_raw) > MAX_AMOUNT_DIGITS:
+                raise gl.vm.UserError(
+                    "milestone amount has too many digits"
+                )
+
+            normalized_amount = amount_raw.lstrip("0") or "0"
+
+            if (
+                len(normalized_amount) == len(MAX_U256_DECIMAL)
+                and normalized_amount > MAX_U256_DECIMAL
+            ):
+                raise gl.vm.UserError(
+                    "milestone amount exceeds u256"
+                )
+
+            amount = u256(int(normalized_amount))
 
             if amount == u256(0):
                 raise gl.vm.UserError("milestone amount must be positive")
@@ -403,6 +430,24 @@ class ProjectEscrow(gl.Contract):
             raise gl.vm.UserError("milestone is not active")
 
     def _append_attempt(self, index, url, notes, kind):
+        if len(notes) > MAX_NOTES_CHARS:
+            raise gl.vm.UserError(
+                "attempt notes are too long"
+            )
+
+        if (
+            int(self.milestone_attempt_counts[index])
+            >= MAX_ATTEMPTS_PER_MILESTONE
+        ):
+            raise gl.vm.UserError(
+                "milestone attempt limit reached"
+            )
+
+        if len(self.attempt_urls) >= MAX_ATTEMPTS_TOTAL:
+            raise gl.vm.UserError(
+                "project attempt limit reached"
+            )
+
         attempt_index = u32(len(self.attempt_urls))
 
         self.attempt_milestones.append(u32(index))
@@ -455,7 +500,7 @@ class ProjectEscrow(gl.Contract):
         self._append_attempt(
             milestone_index,
             canonical,
-            notes[:MAX_NOTES_CHARS],
+            notes,
             kind,
         )
 
@@ -520,7 +565,7 @@ class ProjectEscrow(gl.Contract):
         self._append_attempt(
             milestone_index,
             canonical,
-            notes[:MAX_NOTES_CHARS],
+            notes,
             kind,
         )
 
