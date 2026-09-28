@@ -981,6 +981,16 @@ class ProjectEscrow(gl.Contract):
         criteria_copy = self._milestone_criteria(milestone_index)
         mask_copy = self.milestone_required_mask[milestone_index]
 
+        # P1 rubric identity, read once from immutable milestone storage so
+        # the leader and every validator derive it from the same bytes. It is
+        # carried on every leader result, including unavailable ones, so a
+        # rubric mismatch is caught on any reviewable path.
+        rubric_hash_copy = _rubric_hash(
+            criteria_copy,
+            mask_copy,
+            spec_copy,
+        )
+
         def leader_fn():
             try:
                 response = gl.nondet.web.get(url_copy)
@@ -990,6 +1000,7 @@ class ProjectEscrow(gl.Contract):
                     "approved": False,
                     "reason": "artifact fetch failed",
                     "criteria_bits": "",
+                    "rubric_hash": rubric_hash_copy,
                     "evidence_hash": "",
                     "excerpt": "",
                 }
@@ -1003,6 +1014,7 @@ class ProjectEscrow(gl.Contract):
                         + str(response.status)
                     ),
                     "criteria_bits": "",
+                    "rubric_hash": rubric_hash_copy,
                     "evidence_hash": "",
                     "excerpt": "",
                 }
@@ -1016,6 +1028,7 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
                     }
@@ -1028,6 +1041,7 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
                     }
@@ -1042,6 +1056,7 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
                     }
@@ -1064,6 +1079,7 @@ class ProjectEscrow(gl.Contract):
                         "insufficient evidence"
                     ),
                     "criteria_bits": "",
+                    "rubric_hash": rubric_hash_copy,
                     "evidence_hash": evidence_hash,
                     "excerpt": excerpt,
                 }
@@ -1094,6 +1110,7 @@ class ProjectEscrow(gl.Contract):
                 "approved": approved,
                 "reason": reason,
                 "criteria_bits": criteria_bits,
+                "rubric_hash": rubric_hash_copy,
                 "evidence_hash": evidence_hash,
                 "excerpt": excerpt,
             }
@@ -1105,6 +1122,11 @@ class ProjectEscrow(gl.Contract):
             try:
                 validator_data = leader_fn()
 
+                # Only reason stays unbound: it is free-form model prose
+                # and may legitimately differ between validators. excerpt is
+                # derived deterministically by the contract from the fetched
+                # bytes, so identical evidence yields an identical excerpt
+                # and binding it costs no stability.
                 return (
                     leader_result.calldata["outcome"]
                     == validator_data["outcome"]
@@ -1112,6 +1134,12 @@ class ProjectEscrow(gl.Contract):
                     == validator_data["approved"]
                     and leader_result.calldata["evidence_hash"]
                     == validator_data["evidence_hash"]
+                    and leader_result.calldata["criteria_bits"]
+                    == validator_data["criteria_bits"]
+                    and leader_result.calldata["rubric_hash"]
+                    == validator_data["rubric_hash"]
+                    and leader_result.calldata["excerpt"]
+                    == validator_data["excerpt"]
                 )
             except Exception:
                 return False
