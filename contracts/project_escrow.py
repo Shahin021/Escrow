@@ -532,6 +532,12 @@ class ProjectEscrow(gl.Contract):
     attempt_verdicts: DynArray[str]
     attempt_reasons: DynArray[str]
 
+    # Per-attempt record of the consensus-agreed criteria vector. Audit data
+    # only: payment and state semantics stay exactly as P2/P3 defined them.
+    # The rubric itself is immutable milestone state and is not duplicated
+    # here; get_milestone_rubric_hash already reproduces its identity.
+    attempt_criteria_bits: DynArray[str]
+
     outflow_kinds: DynArray[str]
     outflow_milestones: DynArray[u32]
     outflow_recipients: DynArray[Address]
@@ -823,6 +829,7 @@ class ProjectEscrow(gl.Contract):
         self.attempt_excerpts.append("")
         self.attempt_verdicts.append("PENDING")
         self.attempt_reasons.append("")
+        self.attempt_criteria_bits.append("")
 
         self.milestone_current_attempt[index] = attempt_index
         self.milestone_attempt_counts[index] = u32(
@@ -1159,6 +1166,13 @@ class ProjectEscrow(gl.Contract):
         )
         self.attempt_reasons[attempt_index] = str(
             verdict["reason"]
+        )
+
+        # Written only after run_nondet_unsafe returned, so leader-only or
+        # disagreed data can never reach storage. UNAVAILABLE keeps "",
+        # because no criterion was adjudicated.
+        self.attempt_criteria_bits[attempt_index] = str(
+            verdict["criteria_bits"]
         )
 
         if outcome == "UNAVAILABLE":
@@ -1652,6 +1666,19 @@ class ProjectEscrow(gl.Contract):
         return self.criterion_texts[start + position]
 
     @gl.public.view
+    def get_criterion_required(self, index: int, position: int) -> bool:
+        """Derived from the immutable required mask, not a second array."""
+        if index < 0 or index >= len(self.milestone_criteria_count):
+            raise gl.vm.UserError("milestone index out of range")
+
+        count = int(self.milestone_criteria_count[index])
+
+        if position < 0 or position >= count:
+            raise gl.vm.UserError("criterion position out of range")
+
+        return self.milestone_required_mask[index][position] == "1"
+
+    @gl.public.view
     def get_milestone_rubric_hash(self, index: int) -> str:
         """Rubric identity, reproducible by an external auditor."""
         if index < 0 or index >= len(self.milestone_criteria_count):
@@ -1771,6 +1798,14 @@ class ProjectEscrow(gl.Contract):
         ):
             raise gl.vm.UserError("attempt index out of range")
         return self.attempt_reasons[attempt_index]
+
+    @gl.public.view
+    def get_attempt_criteria_bits(self, attempt_index: int) -> str:
+        if attempt_index < 0 or attempt_index >= len(
+            self.attempt_criteria_bits
+        ):
+            raise gl.vm.UserError("attempt index out of range")
+        return self.attempt_criteria_bits[attempt_index]
 
     @gl.public.view
     def get_allowed_sources(self) -> str:
