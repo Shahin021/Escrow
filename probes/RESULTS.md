@@ -26,8 +26,11 @@ These contracts are non-production and exist only to answer runtime questions th
 | L6 | `web.get` redirect behavior | PASS |
 | L7 | `DynArray` / `TreeMap` persistence | PASS |
 | L8 | contract-to-contract emitted message delivery | PASS |
+| L9 | value attached to a payable method that reverts after entry | **NOT YET RUN** |
 
-All live runtime questions required for Phase 0 are now closed.
+All live runtime questions required for Phase 0 are closed.
+
+L9 is a Phase 3 question and is still open. See the section at the end.
 
 ## L1 — Aggregate views and large integers
 
@@ -494,3 +497,62 @@ Selected live evidence is integrity-checked through:
 and verified by:
 
 `probes/verify_selected.py`
+
+## L9 — Value attached to a payable method that reverts after entry
+
+Status: **NOT YET RUN.** Nothing below is inferred.
+
+### Question
+
+L3 established what happens to value sent to a method-less path and to a
+non-payable method. It did not establish this case:
+
+```
+enter a @gl.public.write.payable method
+-> the method body executes
+-> the contract raises gl.vm.UserError
+```
+
+The Phase 3 appeal bond depends on the answer. `appeal()` is payable and can
+revert after entry for wrong bond amount, a closed appeal window, an appeal
+already used, a wrong milestone state, an oversized note, or an attempt-limit
+failure. If attached value survives such a revert while state rolls back,
+an invalid appeal transaction would strand worker value outside the ledger.
+
+### How to run
+
+```bash
+export GENLAYER_PRIVATE_KEY=0x...
+PROBE_ONLY=L9 PROBE_REUSE_A=<probe A address> PROBE_REUSE_B=<probe B address> \
+    python probes/run_bradbury_probes.py
+```
+
+The step records, for both `payable_revert` and `payable_revert_after_write`:
+contract balance before, the transaction receipt and result, contract balance
+after, and the probe state before and after (`deposits_total`, `get_times`),
+so value behaviour and state rollback are observed separately.
+
+### Result
+
+| Observation | Value |
+| --- | --- |
+| Transaction hash (`payable_revert`) | not run |
+| Result / status | not run |
+| Balance before / after | not run |
+| Transaction hash (`payable_revert_after_write`) | not run |
+| Result / status | not run |
+| Balance before / after | not run |
+| `deposits_total` before / after | not run |
+| `get_times` before / after | not run |
+
+### Consequence for V3
+
+To be filled from the observation:
+
+- **If value is rolled back on a payable UserError:** the exact-bond
+  `appeal()` interface is safe, and its safety note must cite L9 rather
+  than L3.
+- **If value can remain in the contract:** the exact-value revert path is
+  not acceptable and bond intake must be redesigned (for example a payable
+  credit path plus a non-payable `appeal()` that consumes accounted credit,
+  with unused credit recoverable through the serialized outflow engine).

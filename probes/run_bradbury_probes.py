@@ -19,7 +19,7 @@ Optional environment:
     PROBE_ONLY           comma list to run a subset, e.g. "L1,L7" (deploy always runs)
     PROBE_REUSE_A / PROBE_REUSE_B   reuse already-deployed probe addresses
 
-Spend: 2 deploys + ~15 transactions + 3 units deposited (default 0.003 GEN),
+Spend: 2 deploys + ~18 transactions + 3 units deposited (default 0.003 GEN),
 of which 1 unit goes to PROBE_EOA_RECIPIENT and up to 1 unit may remain in
 probe B. Bradbury testnet GEN only.
 """
@@ -564,6 +564,23 @@ def main() -> int:
             rec.add("L6", f"url {label}", url=url)
             write("L6", A, "fetch", [url], final=False)
         read("L6", A, "get_fetches")
+
+    # ---- L9: payable method that reverts after entry ---------------------------------------
+    if want("L9"):
+        read("L9", A, "balance_now", label="balance_before")
+        read("L9", A, "deposits_total", label="deposits_before")
+        read("L9", A, "get_times", label="times_before")
+
+        write("L9", A, "payable_revert", value=UNIT)
+        read("L9", A, "balance_now", label="balance_after_plain_revert")
+
+        write("L9", A, "payable_revert_after_write", value=UNIT)
+        read("L9", A, "balance_now", label="balance_after_write_revert")
+        read("L9", A, "deposits_total", label="deposits_after")
+        read("L9", A, "get_times", label="times_after")
+
+        poll("L9", "A.balance_now settling",
+             lambda: client.read_contract(address=A, function_name="balance_now", args=[]))
 
     # ---- L8: contract-to-contract message -----------------------------------------------------
     if want("L8"):
