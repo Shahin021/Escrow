@@ -83,6 +83,8 @@ IMPLICIT_CRITERION_TEXT = (
 # Boundary rule, applied uniformly: a deadline action is allowed when
 # now >= deadline, and a window action is allowed while now < expiry.
 SECONDS_PER_DAY = 86400
+REVIEW_STALL_SECONDS = 24 * 3600
+EVIDENCE_UNAVAILABLE_GRACE_SECONDS = 48 * 3600
 MIN_DELIVERY_WINDOW_SECONDS = 1
 MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
 
@@ -722,6 +724,12 @@ class ProjectEscrow(gl.Contract):
     # relative so a locked future milestone cannot age before it is active.
     milestone_delivery_windows: DynArray[u256]
     milestone_activated_at: DynArray[u256]
+    # Start of the current review attempt; 0 when not under review.
+    milestone_review_started_at: DynArray[u256]
+    # Start of the CURRENT continuous unavailable episode; 0 when none. A
+    # further unavailable retry must not reset it, or the grace could be
+    # postponed indefinitely.
+    milestone_unavailable_since: DynArray[u256]
 
     outflow_kinds: DynArray[str]
     outflow_milestones: DynArray[u32]
@@ -932,6 +940,8 @@ class ProjectEscrow(gl.Contract):
                 u256(delivery_window)
             )
             self.milestone_activated_at.append(u256(0))
+            self.milestone_review_started_at.append(u256(0))
+            self.milestone_unavailable_since.append(u256(0))
 
             self.milestone_criteria_start.append(
                 u32(len(self.criterion_texts))
@@ -1009,6 +1019,30 @@ class ProjectEscrow(gl.Contract):
             return 0
 
         return _checked_deadline(activated, window)
+
+    def _start_review(self, index):
+        """Every new review attempt gets its own stall timer."""
+        self.milestone_statuses[index] = "UNDER_REVIEW"
+        self.milestone_review_started_at[index] = u256(self._now())
+
+    def _stall_eligible_at(self, index):
+        started = int(self.milestone_review_started_at[index])
+
+        if started == 0:
+            return 0
+
+        return _checked_deadline(started, REVIEW_STALL_SECONDS)
+
+    def _unavailable_grace_expiry(self, index):
+        since = int(self.milestone_unavailable_since[index])
+
+        if since == 0:
+            return 0
+
+        return _checked_deadline(
+            since,
+            EVIDENCE_UNAVAILABLE_GRACE_SECONDS,
+        )
 
     def _require_active_milestone(self, index):
         if self.project_status != "ACTIVE":
@@ -1107,7 +1141,7 @@ class ProjectEscrow(gl.Contract):
             kind,
         )
 
-        self.milestone_statuses[milestone_index] = "UNDER_REVIEW"
+        self._start_review(milestone_index)
 
     @gl.public.write
     def replace_evidence(
@@ -1139,11 +1173,38 @@ class ProjectEscrow(gl.Contract):
             self.allowed_sources,
         )
 
+        if status == "EVIDENCE_UNAVAILABLE":
+            current_attempt = int(
+                self.milestone_current_attempt[milestone_index]
+            )
+
+            # Pinned URLs name immutable commits, so the same canonical URL
+            # is the same artifact: that is a retry, not a replacement, and
+            # resolve() already serves it for free as RETRY_UNAVAILABLE.
+            # Allowing it here would let a worker end and restart the
+            # continuous episode at will. Checked before any mutation.
+            if canonical == self.attempt_urls[current_attempt]:
+                raise gl.vm.UserError(
+                    "unavailable evidence replacement must use a "
+                    "different artifact"
+                )
+
         costs_revision = True
         kind = "REPLACE_UNDER_REVIEW"
 
         if status == "EVIDENCE_UNAVAILABLE":
             kind = "REPLACE_UNAVAILABLE"
+
+            # After a continuous unavailable episode outlasts the grace
+            # window, the worker gets one free replacement for THAT episode.
+            # The worker is not punished for an external source that stays
+            # unreachable, and the free replacement cannot be repeated
+            # without a new episode.
+            grace_expiry = self._unavailable_grace_expiry(milestone_index)
+
+            if grace_expiry != 0 and self._now() >= grace_expiry:
+                costs_revision = False
+                kind = "REPLACE_UNAVAILABLE_GRACE"
 
         elif status == "REVIEW_STALLED":
             if self.milestone_stall_free_used[milestone_index] == u32(0):
@@ -1172,10 +1233,45 @@ class ProjectEscrow(gl.Contract):
             kind,
         )
 
+        # Replacing the artifact ends any unavailable episode: the new
+        # attempt is a different artifact and starts its own timing.
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+
         if final_rejection:
             self.milestone_statuses[milestone_index] = "REJECTED_FINAL"
+            self.milestone_review_started_at[milestone_index] = u256(0)
         else:
-            self.milestone_statuses[milestone_index] = "UNDER_REVIEW"
+            self._start_review(milestone_index)
+
+    @gl.public.write
+    def mark_review_stalled(self, milestone_index: int) -> None:
+        """Deterministic review timeout.
+
+        A review that never reached consensus leaves no on-chain trace, so
+        the only observable is elapsed time. Permissionless: it moves no
+        value, burns no revision and only unlocks the replacement rules the
+        contract already had for REVIEW_STALLED.
+        """
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "UNDER_REVIEW":
+            raise gl.vm.UserError(
+                "milestone is not under review"
+            )
+
+        eligible_at = self._stall_eligible_at(milestone_index)
+
+        if eligible_at == 0:
+            raise gl.vm.UserError(
+                "review has no recorded start"
+            )
+
+        if self._now() < eligible_at:
+            raise gl.vm.UserError(
+                "review stall window has not passed"
+            )
+
+        self.milestone_statuses[milestone_index] = "REVIEW_STALLED"
 
     @gl.public.write
     def resolve(self, milestone_index: int) -> None:
@@ -1414,7 +1510,26 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "EVIDENCE_UNAVAILABLE"
+
+            # The review attempt is over, so its stall timer must not keep
+            # running: EVIDENCE_UNAVAILABLE cannot be marked stalled, and a
+            # non-zero stall_eligible_at would be observable nonsense.
+            self.milestone_review_started_at[milestone_index] = u256(0)
+
+            # Continuous episode: only the FIRST unavailable result starts
+            # the clock. Further same-URL retries keep the original start, so
+            # retrying cannot postpone the grace window.
+            if self.milestone_unavailable_since[milestone_index] == u256(0):
+                self.milestone_unavailable_since[
+                    milestone_index
+                ] = u256(self._now())
+
             return
+
+        # Evidence became reviewable and was judged, so any unavailable
+        # episode and the review timer are over.
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+        self.milestone_review_started_at[milestone_index] = u256(0)
 
         if outcome == "APPROVED":
             self.attempt_verdicts[attempt_index] = "APPROVED"
@@ -2104,6 +2219,32 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_delivery_windows):
             raise gl.vm.UserError("milestone index out of range")
         return str(self._delivery_deadline(index))
+
+    @gl.public.view
+    def get_milestone_review_started_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_review_started_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_review_started_at[index]))
+
+    @gl.public.view
+    def get_milestone_stall_eligible_at(self, index: int) -> str:
+        """0 when the milestone is not under review."""
+        if index < 0 or index >= len(self.milestone_review_started_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._stall_eligible_at(index))
+
+    @gl.public.view
+    def get_milestone_unavailable_since(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_unavailable_since):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_unavailable_since[index]))
+
+    @gl.public.view
+    def get_milestone_unavailable_grace_expiry(self, index: int) -> str:
+        """0 when no unavailable episode is open."""
+        if index < 0 or index >= len(self.milestone_unavailable_since):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._unavailable_grace_expiry(index))
 
     @gl.public.view
     def get_milestone_status(self, index: int) -> str:
