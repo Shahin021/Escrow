@@ -84,6 +84,10 @@ IMPLICIT_CRITERION_TEXT = (
 # now >= deadline, and a window action is allowed while now < expiry.
 SECONDS_PER_DAY = 86400
 REVIEW_STALL_SECONDS = 24 * 3600
+APPEAL_WINDOW_SECONDS = 3 * SECONDS_PER_DAY
+APPEAL_BOND_BPS = 1000
+BPS_DENOMINATOR = 10000
+MAX_APPEAL_NOTE_CHARS = 500
 EVIDENCE_UNAVAILABLE_GRACE_SECONDS = 48 * 3600
 MIN_DELIVERY_WINDOW_SECONDS = 1
 MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
@@ -241,6 +245,25 @@ def _iso_to_epoch_seconds(text):
         raise gl.vm.UserError("transaction datetime precedes the epoch")
 
     return total
+
+
+def _appeal_bond_for(amount):
+    """ceil(amount * APPEAL_BOND_BPS / BPS_DENOMINATOR), integers only.
+
+    Rounding up guarantees a positive bond for every positive milestone
+    amount, so a tiny milestone cannot be appealed for free. Computed as a
+    single multiply then a ceiling division; no float, and the product of a
+    u256 amount stays exact because Python integers are arbitrary precision,
+    while the result is bounded by the amount itself.
+    """
+    value = int(amount)
+
+    if value <= 0:
+        raise gl.vm.UserError("milestone amount must be positive")
+
+    return (
+        value * APPEAL_BOND_BPS + BPS_DENOMINATOR - 1
+    ) // BPS_DENOMINATOR
 
 
 def _checked_deadline(start, window):
@@ -730,6 +753,15 @@ class ProjectEscrow(gl.Contract):
     # further unavailable retry must not reset it, or the grace could be
     # postponed indefinitely.
     milestone_unavailable_since: DynArray[u256]
+    # Set when a milestone first enters REJECTED_FINAL; 0 otherwise.
+    milestone_final_rejected_at: DynArray[u256]
+    # One appeal per milestone: 0 unused, 1 used (whatever its outcome).
+    milestone_appeal_used: DynArray[u32]
+    # 1 while an appeal adjudication is pending, so an UNAVAILABLE result can
+    # use the ordinary retry path without losing the appeal context.
+    milestone_appeal_open: DynArray[u32]
+    milestone_appeal_bond: DynArray[u256]
+    milestone_appeal_note: DynArray[str]
 
     outflow_kinds: DynArray[str]
     outflow_milestones: DynArray[u32]
@@ -751,6 +783,11 @@ class ProjectEscrow(gl.Contract):
 
     total_released: u256
     total_refunded: u256
+    # Bond accounting is deliberately separate from escrow principal.
+    total_appeal_bonds_received: u256
+    appeal_bond_held: u256
+    total_bonds_returned: u256
+    total_bonds_forfeited: u256
     sent_total: u256
 
     active_milestone: u32
@@ -836,6 +873,10 @@ class ProjectEscrow(gl.Contract):
 
         self.total_released = u256(0)
         self.total_refunded = u256(0)
+        self.total_appeal_bonds_received = u256(0)
+        self.appeal_bond_held = u256(0)
+        self.total_bonds_returned = u256(0)
+        self.total_bonds_forfeited = u256(0)
         self.sent_total = u256(0)
 
         self.active_milestone = u32(0)
@@ -942,6 +983,11 @@ class ProjectEscrow(gl.Contract):
             self.milestone_activated_at.append(u256(0))
             self.milestone_review_started_at.append(u256(0))
             self.milestone_unavailable_since.append(u256(0))
+            self.milestone_final_rejected_at.append(u256(0))
+            self.milestone_appeal_used.append(u32(0))
+            self.milestone_appeal_open.append(u32(0))
+            self.milestone_appeal_bond.append(u256(0))
+            self.milestone_appeal_note.append("")
 
             self.milestone_criteria_start.append(
                 u32(len(self.criterion_texts))
@@ -1166,6 +1212,13 @@ class ProjectEscrow(gl.Contract):
                 f"cannot replace evidence from milestone status {status}"
             )
 
+        # An appeal re-judges the evidence that was finally rejected, so the
+        # worker cannot swap the artifact underneath it.
+        if self.milestone_appeal_open[milestone_index] != u32(0):
+            raise gl.vm.UserError(
+                "cannot replace evidence while an appeal is pending"
+            )
+
         # Validate the replacement BEFORE burning a revision. A malformed
         # reference must never consume the worker's revision budget.
         canonical = _check_pinned_url(
@@ -1240,6 +1293,9 @@ class ProjectEscrow(gl.Contract):
         if final_rejection:
             self.milestone_statuses[milestone_index] = "REJECTED_FINAL"
             self.milestone_review_started_at[milestone_index] = u256(0)
+            self.milestone_final_rejected_at[
+                milestone_index
+            ] = u256(self._now())
         else:
             self._start_review(milestone_index)
 
@@ -1254,7 +1310,13 @@ class ProjectEscrow(gl.Contract):
         """
         self._require_active_milestone(milestone_index)
 
-        if self.milestone_statuses[milestone_index] != "UNDER_REVIEW":
+        # An appeal review uses the same deterministic timer. The appeal
+        # context is carried by milestone_appeal_open, not by the visible
+        # status, so stalling never loses it.
+        if self.milestone_statuses[milestone_index] not in (
+            "UNDER_REVIEW",
+            "UNDER_APPEAL",
+        ):
             raise gl.vm.UserError(
                 "milestone is not under review"
             )
@@ -1283,6 +1345,7 @@ class ProjectEscrow(gl.Contract):
             "UNDER_REVIEW",
             "EVIDENCE_UNAVAILABLE",
             "REVIEW_STALLED",
+            "UNDER_APPEAL",
         ):
             raise gl.vm.UserError(
                 "milestone is not reviewable"
@@ -1531,6 +1594,50 @@ class ProjectEscrow(gl.Contract):
         self.milestone_unavailable_since[milestone_index] = u256(0)
         self.milestone_review_started_at[milestone_index] = u256(0)
 
+        appeal_open = (
+            self.milestone_appeal_open[milestone_index] != u32(0)
+        )
+
+        if appeal_open:
+            # The one allowed appeal is now consumed either way. The rubric,
+            # schema, parser and consensus binding used above are exactly the
+            # Phase 2 ones; only the economics differ.
+            self.milestone_appeal_open[milestone_index] = u32(0)
+
+            if outcome == "APPROVED":
+                self.attempt_verdicts[attempt_index] = "APPROVED"
+                self.milestone_statuses[milestone_index] = "APPROVED"
+
+                # Upheld appeal: the bond goes back to the worker.
+                self._queue_bond_outflow(
+                    milestone_index,
+                    "APPEAL_BOND_RETURN",
+                    self.worker,
+                )
+
+                return
+
+            if outcome != "REJECTED":
+                raise gl.vm.UserError(
+                    "adjudicator returned an unknown outcome"
+                )
+
+            # Denied appeal: the rejection stands, no further revision is
+            # consumed because the milestone was already final, and the bond
+            # is forfeited to the client.
+            self.attempt_verdicts[attempt_index] = "REJECTED"
+            self.milestone_statuses[
+                milestone_index
+            ] = "REJECTED_FINAL"
+
+            self._queue_bond_outflow(
+                milestone_index,
+                "APPEAL_BOND_FORFEIT",
+                self.client,
+            )
+
+            return
+
         if outcome == "APPROVED":
             self.attempt_verdicts[attempt_index] = "APPROVED"
             self.milestone_statuses[milestone_index] = "APPROVED"
@@ -1554,6 +1661,9 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "REJECTED_FINAL"
+            self.milestone_final_rejected_at[
+                milestone_index
+            ] = u256(self._now())
         else:
             self.milestone_statuses[
                 milestone_index
@@ -1645,6 +1755,206 @@ class ProjectEscrow(gl.Contract):
         self.milestone_statuses[milestone_index] = "REFUND_PENDING"
 
         self._emit_one_queued_outflow()
+
+    def _appeal_expiry(self, index):
+        rejected_at = int(self.milestone_final_rejected_at[index])
+
+        if rejected_at == 0:
+            return 0
+
+        return _checked_deadline(rejected_at, APPEAL_WINDOW_SECONDS)
+
+    @gl.public.write.payable
+    def appeal(self, milestone_index: int, note: str = "") -> None:
+        """One worker appeal of a final rejection, backed by a bond.
+
+        The appeal is a fresh consensus adjudication of the same evidence
+        against the same immutable rubric: resolve() does the judging, using
+        the Phase 2 schema, parser and consensus binding unchanged. The note
+        is bounded metadata for the parties only and never enters the
+        adjudication prompt, so appeal prose cannot influence the verdict.
+        """
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError("only the worker can appeal")
+
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "REJECTED_FINAL":
+            raise gl.vm.UserError(
+                "milestone is not finally rejected"
+            )
+
+        if self.milestone_appeal_used[milestone_index] != u32(0):
+            raise gl.vm.UserError(
+                "milestone has already been appealed"
+            )
+
+        if len(note) > MAX_APPEAL_NOTE_CHARS:
+            raise gl.vm.UserError("appeal note is too long")
+
+        expiry = self._appeal_expiry(milestone_index)
+
+        if expiry == 0:
+            raise gl.vm.UserError(
+                "milestone has no final rejection time"
+            )
+
+        # Window rule: allowed while now < expiry, so an appeal at exactly
+        # the expiry instant is too late.
+        if self._now() >= expiry:
+            raise gl.vm.UserError("appeal window has closed")
+
+        required = _appeal_bond_for(
+            self.milestone_amounts[milestone_index]
+        )
+
+        if int(gl.message.value) != required:
+            raise gl.vm.UserError(
+                "appeal must carry exactly the required bond"
+            )
+
+        # Bond value is tracked separately from escrow principal from the
+        # moment it arrives, so it can never be paid out as a milestone.
+        self.total_appeal_bonds_received = u256(
+            self.total_appeal_bonds_received + gl.message.value
+        )
+        self.appeal_bond_held = u256(
+            self.appeal_bond_held + gl.message.value
+        )
+
+        self.milestone_appeal_used[milestone_index] = u32(1)
+        self.milestone_appeal_open[milestone_index] = u32(1)
+        self.milestone_appeal_bond[milestone_index] = u256(
+            gl.message.value
+        )
+        self.milestone_appeal_note[milestone_index] = note
+
+        # Append-only: the final rejected attempt is never rewritten.
+        current_attempt = int(
+            self.milestone_current_attempt[milestone_index]
+        )
+
+        self._append_attempt(
+            milestone_index,
+            self.attempt_urls[current_attempt],
+            "",
+            "APPEAL_REVIEW",
+        )
+
+        self._start_review(milestone_index)
+        self.milestone_statuses[milestone_index] = "UNDER_APPEAL"
+
+    def _queue_bond_outflow(self, milestone_index, kind, recipient):
+        """Move a held bond into the shared serialized outflow engine."""
+        amount = self.milestone_appeal_bond[milestone_index]
+
+        if amount == u256(0):
+            raise gl.vm.UserError("no appeal bond to move")
+
+        if self.appeal_bond_held < amount:
+            raise gl.vm.UserError(
+                "internal bond balance is insufficient"
+            )
+
+        self.appeal_bond_held = u256(
+            self.appeal_bond_held - amount
+        )
+        self.queued_out = u256(self.queued_out + amount)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(milestone_index))
+        self.outflow_recipients.append(recipient)
+        self.outflow_amounts.append(amount)
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
+
+    def _appeal_failure_reason(self, milestone_index):
+        """Why an open appeal may be aborted, or "" when it may not.
+
+        Only infrastructure failure qualifies: a review that never reached
+        consensus within the stall window, or evidence that stayed
+        continuously unavailable past the grace window. A substantive verdict
+        is never reached this way, so the bond is returned rather than
+        forfeited.
+        """
+        if self.milestone_appeal_open[milestone_index] == u32(0):
+            return ""
+
+        status = self.milestone_statuses[milestone_index]
+        now = self._now()
+
+        if status == "REVIEW_STALLED":
+            return "STALLED"
+
+        if status == "UNDER_APPEAL":
+            eligible_at = self._stall_eligible_at(milestone_index)
+
+            if eligible_at != 0 and now >= eligible_at:
+                return "STALLED"
+
+            return ""
+
+        if status == "EVIDENCE_UNAVAILABLE":
+            expiry = self._unavailable_grace_expiry(milestone_index)
+
+            if expiry != 0 and now >= expiry:
+                return "UNAVAILABLE"
+
+            return ""
+
+        return ""
+
+    def _abort_open_appeal(self, milestone_index):
+        """Close a failed appeal without a substantive verdict.
+
+        The rubric, the evidence and the attempt history are untouched, no
+        revision is burned, the principal stays locked for the later
+        final-rejection path, and the bond goes back to the worker. The
+        appeal slot stays used: one appeal was promised, and an
+        infrastructure abort must not create an unlimited retry loop.
+        """
+        attempt_index = int(
+            self.milestone_current_attempt[milestone_index]
+        )
+
+        # The open APPEAL_REVIEW attempt never produced a verdict. Mark it
+        # terminally rather than leaving it deceptively PENDING. No criteria
+        # bits and no adjudicator reason are fabricated.
+        if self.attempt_verdicts[attempt_index] == "PENDING":
+            self.attempt_verdicts[attempt_index] = "ABORTED"
+
+        self.milestone_appeal_open[milestone_index] = u32(0)
+        self.milestone_review_started_at[milestone_index] = u256(0)
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+        self.milestone_statuses[milestone_index] = "REJECTED_FINAL"
+
+        self._queue_bond_outflow(
+            milestone_index,
+            "APPEAL_BOND_RETURN",
+            self.worker,
+        )
+
+    @gl.public.write
+    def abort_failed_appeal(self, milestone_index: int) -> None:
+        """Worker escape from an appeal that cannot be adjudicated."""
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError(
+                "only the worker can abort an appeal"
+            )
+
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_appeal_open[milestone_index] == u32(0):
+            raise gl.vm.UserError("no appeal is open")
+
+        if self._appeal_failure_reason(milestone_index) == "":
+            raise gl.vm.UserError(
+                "appeal has not failed yet"
+            )
+
+        self._abort_open_appeal(milestone_index)
 
     @gl.public.write
     def expire_delivery(self, milestone_index: int) -> None:
@@ -1785,6 +2095,16 @@ class ProjectEscrow(gl.Contract):
                     "only the worker can redirect this outflow"
                 )
         elif kind in ("MILESTONE_REFUND", "PROJECT_REMAINDER_REFUND"):
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
+                )
+        elif kind == "APPEAL_BOND_RETURN":
+            if gl.message.sender_address != self.worker:
+                raise gl.vm.UserError(
+                    "only the worker can redirect this outflow"
+                )
+        elif kind == "APPEAL_BOND_FORFEIT":
             if gl.message.sender_address != self.client:
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
@@ -1980,6 +2300,36 @@ class ProjectEscrow(gl.Contract):
 
             self.project_status = "SETTLING"
 
+        elif kind == "APPEAL_BOND_RETURN":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # A bond return is not a milestone payout: it never touches
+            # total_released.
+            self.total_bonds_returned = u256(
+                self.total_bonds_returned + amount
+            )
+
+        elif kind == "APPEAL_BOND_FORFEIT":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Forfeiture to the client is not a principal refund: it never
+            # touches total_refunded.
+            self.total_bonds_forfeited = u256(
+                self.total_bonds_forfeited + amount
+            )
+
         else:
             raise gl.vm.UserError(
                 "unsupported outflow kind"
@@ -2002,6 +2352,7 @@ class ProjectEscrow(gl.Contract):
             or self.inflight_out != u256(0)
             or self.bounced_held != u256(0)
             or self.unmatched_held != u256(0)
+            or self.appeal_bond_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
@@ -2080,11 +2431,26 @@ class ProjectEscrow(gl.Contract):
             "released": str(int(self.total_released)),
             "refunded": str(int(self.total_refunded)),
             "sent_total": str(int(self.sent_total)),
+            "appeal_bonds_received": str(
+                int(self.total_appeal_bonds_received)
+            ),
+            "appeal_bond_held": str(int(self.appeal_bond_held)),
+            "bonds_returned": str(int(self.total_bonds_returned)),
+            "bonds_forfeited": str(int(self.total_bonds_forfeited)),
         }
 
     @gl.public.view
     def get_outflow_count(self) -> u32:
         return u32(len(self.outflow_statuses))
+
+    @gl.public.view
+    def get_outflow_kind(self, outflow_id: int) -> str:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_kinds)
+        ):
+            raise gl.vm.UserError("outflow index out of range")
+        return self.outflow_kinds[outflow_id]
 
     @gl.public.view
     def get_outflow_status(self, outflow_id: int) -> str:
@@ -2219,6 +2585,88 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_delivery_windows):
             raise gl.vm.UserError("milestone index out of range")
         return str(self._delivery_deadline(index))
+
+    @gl.public.view
+    def get_appeal_bond_held(self) -> str:
+        return str(int(self.appeal_bond_held))
+
+    @gl.public.view
+    def get_total_appeal_bonds_received(self) -> str:
+        return str(int(self.total_appeal_bonds_received))
+
+    @gl.public.view
+    def get_total_bonds_returned(self) -> str:
+        return str(int(self.total_bonds_returned))
+
+    @gl.public.view
+    def get_total_bonds_forfeited(self) -> str:
+        return str(int(self.total_bonds_forfeited))
+
+    @gl.public.view
+    def get_milestone_required_appeal_bond(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_amounts):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(_appeal_bond_for(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def get_milestone_final_rejected_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_final_rejected_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_final_rejected_at[index]))
+
+    @gl.public.view
+    def get_milestone_appeal_expiry(self, index: int) -> str:
+        """0 when the milestone has never been finally rejected."""
+        if index < 0 or index >= len(self.milestone_final_rejected_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._appeal_expiry(index))
+
+    @gl.public.view
+    def get_milestone_appeal_used(self, index: int) -> bool:
+        if index < 0 or index >= len(self.milestone_appeal_used):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_used[index] != u32(0)
+
+    @gl.public.view
+    def get_milestone_appeal_open(self, index: int) -> bool:
+        if index < 0 or index >= len(self.milestone_appeal_open):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_open[index] != u32(0)
+
+    @gl.public.view
+    def get_milestone_appeal_failure_threshold(self, index: int) -> str:
+        """Timestamp from which an open appeal may be aborted, or 0.
+
+        Deterministic stored state only: no view reads the clock, because
+        datetime semantics inside a view call are not runtime-verified.
+        """
+        if index < 0 or index >= len(self.milestone_appeal_open):
+            raise gl.vm.UserError("milestone index out of range")
+
+        if self.milestone_appeal_open[index] == u32(0):
+            return "0"
+
+        status = self.milestone_statuses[index]
+
+        if status == "REVIEW_STALLED":
+            return "0"
+
+        if status == "EVIDENCE_UNAVAILABLE":
+            return str(self._unavailable_grace_expiry(index))
+
+        return str(self._stall_eligible_at(index))
+
+    @gl.public.view
+    def get_milestone_appeal_bond(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_appeal_bond):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_appeal_bond[index]))
+
+    @gl.public.view
+    def get_milestone_appeal_note(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_appeal_note):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_note[index]
 
     @gl.public.view
     def get_milestone_review_started_at(self, index: int) -> str:
