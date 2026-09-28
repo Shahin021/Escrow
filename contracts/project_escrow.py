@@ -1487,6 +1487,81 @@ class ProjectEscrow(gl.Contract):
 
         return False
 
+    def _queue_refund_for_failed_milestone(self, milestone_index):
+        """The single place principal is returned to the client.
+
+        continue_after_refund == True refunds this milestone's principal
+        only. False stops the project, so every still-locked future milestone
+        is client principal too and the whole remaining locked balance is
+        returned in one outflow; otherwise that funding would be stranded.
+
+        Queueing is not finality: statuses, total_refunded and any
+        progression happen in confirm_outflow, mirroring MILESTONE_PAYOUT.
+        """
+        amount = self.milestone_amounts[milestone_index]
+
+        if self.locked < amount:
+            raise gl.vm.UserError(
+                "internal locked balance is insufficient"
+            )
+
+        if self.continue_after_refund:
+            kind = "MILESTONE_REFUND"
+            refund = amount
+        else:
+            kind = "PROJECT_REMAINDER_REFUND"
+            refund = self.locked
+
+        if refund == u256(0):
+            raise gl.vm.UserError(
+                "refund amount is zero"
+            )
+
+        self.locked = u256(self.locked - refund)
+        self.queued_out = u256(self.queued_out + refund)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(milestone_index))
+        self.outflow_recipients.append(self.client)
+        self.outflow_amounts.append(refund)
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self.milestone_statuses[milestone_index] = "REFUND_PENDING"
+
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
+    def expire_delivery(self, milestone_index: int) -> None:
+        """Deterministic delivery timeout.
+
+        Permissionless: it moves value only to the client along the same
+        refund path either party could already trigger, and every input is
+        contract state plus the transaction datetime, so no caller can
+        influence the outcome or the recipient.
+        """
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "AWAITING_DELIVERY":
+            raise gl.vm.UserError(
+                "milestone is not awaiting delivery"
+            )
+
+        deadline = self._delivery_deadline(milestone_index)
+
+        if deadline == 0:
+            raise gl.vm.UserError(
+                "milestone has no delivery deadline"
+            )
+
+        # Boundary rule: a deadline action is allowed when now >= deadline.
+        if self._now() < deadline:
+            raise gl.vm.UserError(
+                "delivery deadline has not passed"
+            )
+
+        self._queue_refund_for_failed_milestone(milestone_index)
+
     @gl.public.write
     def claim_payment(self, milestone_index: int) -> None:
         if gl.message.sender_address != self.worker:
@@ -1588,10 +1663,16 @@ class ProjectEscrow(gl.Contract):
 
         kind = self.outflow_kinds[outflow_id]
 
+        # Only the economic owner of the value may redirect it.
         if kind == "MILESTONE_PAYOUT":
             if gl.message.sender_address != self.worker:
                 raise gl.vm.UserError(
                     "only the worker can redirect this outflow"
+                )
+        elif kind in ("MILESTONE_REFUND", "PROJECT_REMAINDER_REFUND"):
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
                 )
         else:
             raise gl.vm.UserError(
@@ -1672,48 +1753,122 @@ class ProjectEscrow(gl.Contract):
 
         kind = self.outflow_kinds[outflow_id]
 
-        if kind != "MILESTONE_PAYOUT":
-            raise gl.vm.UserError(
-                "unsupported outflow kind"
-            )
-
         milestone_index = int(
             self.outflow_milestones[outflow_id]
         )
 
-        if (
-            self.milestone_statuses[milestone_index]
-            != "PAYMENT_PENDING"
-        ):
-            raise gl.vm.UserError(
-                "milestone is not payment pending"
+        # Dispatch by kind. Each kind verifies its own expected state before
+        # anything is confirmed, and confirmation stays exactly-once.
+        if kind == "MILESTONE_PAYOUT":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "PAYMENT_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not payment pending"
+                )
+
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            self.total_released = u256(
+                self.total_released + amount
             )
 
-        # Confirm exactly once.
-        self.outflow_statuses[outflow_id] = "CONFIRMED"
+            self.milestone_statuses[
+                milestone_index
+            ] = "RELEASED"
 
-        self.inflight_out = u256(
-            self.inflight_out - amount
-        )
-        self.sent_total = u256(
-            self.sent_total + amount
-        )
-        self.total_released = u256(
-            self.total_released + amount
-        )
+            next_index = milestone_index + 1
 
-        self.milestone_statuses[
-            milestone_index
-        ] = "RELEASED"
+            if next_index < len(self.milestone_statuses):
+                self._activate_milestone(next_index)
+            else:
+                # No work remains. Project closure is explicit so that later
+                # settlement/refund outflows can use the same rule.
+                self.project_status = "SETTLING"
 
-        next_index = milestone_index + 1
+        elif kind == "MILESTONE_REFUND":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "REFUND_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not refund pending"
+                )
 
-        if next_index < len(self.milestone_statuses):
-            self._activate_milestone(next_index)
-        else:
-            # No work remains. Project closure is explicit so that later
-            # settlement/refund outflows can use the same rule.
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Escrow principal returned to the client. Bond flows added later
+            # in Phase 3 must never be counted here.
+            self.total_refunded = u256(
+                self.total_refunded + amount
+            )
+
+            self.milestone_statuses[
+                milestone_index
+            ] = "REFUNDED"
+
+            # Financial finality first, progression second.
+            next_index = milestone_index + 1
+
+            if next_index < len(self.milestone_statuses):
+                self._activate_milestone(next_index)
+            else:
+                self.project_status = "SETTLING"
+
+        elif kind == "PROJECT_REMAINDER_REFUND":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "REFUND_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not refund pending"
+                )
+
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            self.total_refunded = u256(
+                self.total_refunded + amount
+            )
+
+            self.milestone_statuses[
+                milestone_index
+            ] = "REFUNDED"
+
+            # The project stops here, so every untouched future milestone is
+            # terminal only now that its principal has actually gone back.
+            i = milestone_index + 1
+
+            while i < len(self.milestone_statuses):
+                if self.milestone_statuses[i] == "LOCKED":
+                    self.milestone_statuses[i] = "CANCELLED"
+
+                i += 1
+
             self.project_status = "SETTLING"
+
+        else:
+            raise gl.vm.UserError(
+                "unsupported outflow kind"
+            )
 
         # Future phases may queue multiple serialized outflows.
         # If one already exists, emit it after confirming this one.
