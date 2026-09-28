@@ -71,8 +71,187 @@ IMPLICIT_CRITERION_TEXT = (
     "agreed milestone specification."
 )
 
+# Phase 3 fairness timing.
+#
+# Time source: gl.message_raw["datetime"], the transaction datetime. This is
+# the only time source the contract uses. It was verified live on Bradbury by
+# probe L2 (probes/RESULTS.md), which observed three monotonically increasing
+# ISO-8601 Z timestamps across three writes. Wall-clock calls such as
+# datetime.now() are deliberately NOT used: they are not established as
+# deterministic across validators, and money depends on this value.
+#
+# Boundary rule, applied uniformly: a deadline action is allowed when
+# now >= deadline, and a window action is allowed while now < expiry.
+SECONDS_PER_DAY = 86400
+MIN_DELIVERY_WINDOW_SECONDS = 1
+MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
+
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
+
+
+def _is_json_int(value):
+    """Real JSON integer only.
+
+    bool is a subclass of int in Python, and a JSON float or numeric string
+    must not be silently accepted, so each is rejected explicitly.
+    """
+    if value is True or value is False:
+        return False
+
+    return isinstance(value, int)
+
+
+def _days_from_civil(year, month, day):
+    """Days since 1970-01-01, integer arithmetic only (Howard Hinnant)."""
+    y = year
+
+    if month <= 2:
+        y -= 1
+
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+
+    if month > 2:
+        mp = month - 3
+    else:
+        mp = month + 9
+
+    doy = (153 * mp + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+
+    return era * 146097 + doe - 719468
+
+
+def _is_ascii_digits(text):
+    """ASCII 0-9 only.
+
+    str.isdigit() accepts Unicode digit forms such as Arabic-Indic or
+    full-width digits, which int() would then parse into a value the grammar
+    never promised. This timestamp feeds deadlines, so the check is literal
+    and has no locale or Unicode-category dependency.
+    """
+    if len(text) == 0:
+        return False
+
+    for ch in text:
+        if ch < "0" or ch > "9":
+            return False
+
+    return True
+
+
+def _is_leap_year(year):
+    """Gregorian rule, integer arithmetic only."""
+    if year % 4 != 0:
+        return False
+
+    if year % 100 != 0:
+        return True
+
+    return year % 400 == 0
+
+
+def _days_in_month(year, month):
+    if month in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+
+    if month in (4, 6, 9, 11):
+        return 30
+
+    return 29 if _is_leap_year(year) else 28
+
+
+def _iso_to_epoch_seconds(text):
+    """Parse the transaction datetime into integer epoch seconds.
+
+    Grammar, accepted exactly and nothing else:
+
+        YYYY-MM-DDTHH:MM:SS[.<digits>]Z
+
+    The string is validated as supplied: no stripping, so surrounding
+    whitespace is malformed rather than silently tolerated. A fraction must
+    be a dot followed by at least one ASCII digit, and is truncated to whole
+    seconds, so no float ever enters a comparison. Calendar dates are
+    validated per month with the Gregorian leap rule, so 2026-02-29 and
+    2026-04-31 are rejected rather than normalized. Seconds are 00..59:
+    leap-second input was never observed on Bradbury, and clamping 60 to 59
+    would map two distinct timestamps onto one instant. Anything else raises,
+    because a mis-parsed timestamp would move money.
+    """
+    if not isinstance(text, str):
+        raise gl.vm.UserError("transaction datetime is not a string")
+
+    raw = text
+
+    if not raw.endswith("Z"):
+        raise gl.vm.UserError("transaction datetime is not UTC")
+
+    body = raw[:-1]
+
+    if "." in body:
+        body, fraction = body.split(".", 1)
+
+        if not _is_ascii_digits(fraction):
+            raise gl.vm.UserError(
+                "malformed transaction datetime fraction"
+            )
+
+    if len(body) != 19 or body[4] != "-" or body[7] != "-":
+        raise gl.vm.UserError("malformed transaction datetime")
+
+    if body[10] != "T" or body[13] != ":" or body[16] != ":":
+        raise gl.vm.UserError("malformed transaction datetime")
+
+    parts = (
+        body[0:4],
+        body[5:7],
+        body[8:10],
+        body[11:13],
+        body[14:16],
+        body[17:19],
+    )
+
+    for part in parts:
+        if not _is_ascii_digits(part):
+            raise gl.vm.UserError("malformed transaction datetime")
+
+    year = int(parts[0])
+    month = int(parts[1])
+    day = int(parts[2])
+    hour = int(parts[3])
+    minute = int(parts[4])
+    second = int(parts[5])
+
+    if month < 1 or month > 12:
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    if day < 1 or day > _days_in_month(year, month):
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    if hour > 23 or minute > 59 or second > 59:
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    days = _days_from_civil(year, month, day)
+    total = days * 86400 + hour * 3600 + minute * 60 + second
+
+    if total < 0:
+        raise gl.vm.UserError("transaction datetime precedes the epoch")
+
+    return total
+
+
+def _checked_deadline(start, window):
+    """start + window with an explicit bound, never wrapping."""
+    if start < 0 or window < 0:
+        raise gl.vm.UserError("negative timing value")
+
+    deadline = start + window
+
+    if deadline > int(MAX_U256_DECIMAL):
+        raise gl.vm.UserError("deadline overflows u256")
+
+    return deadline
 
 
 def _split_sources(raw):
@@ -538,6 +717,12 @@ class ProjectEscrow(gl.Contract):
     # here; get_milestone_rubric_hash already reproduces its identity.
     attempt_criteria_bits: DynArray[str]
 
+    # Phase 3 timing. Both are epoch seconds derived from the transaction
+    # datetime; 0 means "not configured" / "not activated yet". A window is
+    # relative so a locked future milestone cannot age before it is active.
+    milestone_delivery_windows: DynArray[u256]
+    milestone_activated_at: DynArray[u256]
+
     outflow_kinds: DynArray[str]
     outflow_milestones: DynArray[u32]
     outflow_recipients: DynArray[Address]
@@ -723,6 +908,31 @@ class ProjectEscrow(gl.Contract):
             ):
                 raise gl.vm.UserError("too many criteria in project")
 
+            if "delivery_window_seconds" not in raw:
+                delivery_window = 0
+            else:
+                delivery_window = raw["delivery_window_seconds"]
+
+                if not _is_json_int(delivery_window):
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds must be a JSON integer"
+                    )
+
+                if delivery_window < MIN_DELIVERY_WINDOW_SECONDS:
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds must be positive"
+                    )
+
+                if delivery_window > MAX_DELIVERY_WINDOW_SECONDS:
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds is too large"
+                    )
+
+            self.milestone_delivery_windows.append(
+                u256(delivery_window)
+            )
+            self.milestone_activated_at.append(u256(0))
+
             self.milestone_criteria_start.append(
                 u32(len(self.criterion_texts))
             )
@@ -773,8 +983,32 @@ class ProjectEscrow(gl.Contract):
         self.locked = u256(self.total_required)
 
         self.project_status = "ACTIVE"
-        self.active_milestone = u32(0)
-        self.milestone_statuses[0] = "AWAITING_DELIVERY"
+        self._activate_milestone(0)
+
+    def _now(self):
+        """The single Phase 3 time source: the transaction datetime.
+
+        Read only on write transactions. Probe L2 observed this field on
+        three live Bradbury writes (record_time); nothing establishes its
+        semantics during a public view call, so no view reads a fresh clock.
+        """
+        return _iso_to_epoch_seconds(gl.message_raw["datetime"])
+
+    def _activate_milestone(self, index):
+        """Open a milestone for delivery and stamp its activation time."""
+        self.active_milestone = u32(index)
+        self.milestone_statuses[index] = "AWAITING_DELIVERY"
+        self.milestone_activated_at[index] = u256(self._now())
+
+    def _delivery_deadline(self, index):
+        """0 when no window is configured or the milestone is not active."""
+        window = int(self.milestone_delivery_windows[index])
+        activated = int(self.milestone_activated_at[index])
+
+        if window == 0 or activated == 0:
+            return 0
+
+        return _checked_deadline(activated, window)
 
     def _require_active_milestone(self, index):
         if self.project_status != "ACTIVE":
@@ -1475,10 +1709,7 @@ class ProjectEscrow(gl.Contract):
         next_index = milestone_index + 1
 
         if next_index < len(self.milestone_statuses):
-            self.active_milestone = u32(next_index)
-            self.milestone_statuses[
-                next_index
-            ] = "AWAITING_DELIVERY"
+            self._activate_milestone(next_index)
         else:
             # No work remains. Project closure is explicit so that later
             # settlement/refund outflows can use the same rule.
@@ -1699,6 +1930,25 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_amounts):
             raise gl.vm.UserError("milestone index out of range")
         return str(int(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def get_milestone_delivery_window(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_delivery_windows):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_delivery_windows[index]))
+
+    @gl.public.view
+    def get_milestone_activated_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_activated_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_activated_at[index]))
+
+    @gl.public.view
+    def get_milestone_delivery_deadline(self, index: int) -> str:
+        """0 when no window is configured or the milestone is not active."""
+        if index < 0 or index >= len(self.milestone_delivery_windows):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._delivery_deadline(index))
 
     @gl.public.view
     def get_milestone_status(self, index: int) -> str:
