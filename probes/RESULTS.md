@@ -26,7 +26,8 @@ These contracts are non-production and exist only to answer runtime questions th
 | L6 | `web.get` redirect behavior | PASS |
 | L7 | `DynArray` / `TreeMap` persistence | PASS |
 | L8 | contract-to-contract emitted message delivery | PASS |
-| L9 | value attached to a payable method that reverts after entry | **NOT YET RUN** |
+| L9A | value attached to a payable method that reverts after entry | **RETAINED** (see below) |
+| L9B | rollback of a state write made before the raise | **NOT YET RUN** |
 
 All live runtime questions required for Phase 0 are closed.
 
@@ -500,7 +501,7 @@ and verified by:
 
 ## L9 — Value attached to a payable method that reverts after entry
 
-Status: **NOT YET RUN.** Nothing below is inferred.
+Status: **L9A OBSERVED LIVE. L9B not yet run.** Nothing below is inferred.
 
 ### Question
 
@@ -532,18 +533,56 @@ contract balance before, the transaction receipt and result, contract balance
 after, and the probe state before and after (`deposits_total`, `get_times`),
 so value behaviour and state rollback are observed separately.
 
-### Result
+### Result — L9A (`payable_revert`), observed live
 
 | Observation | Value |
 | --- | --- |
-| Transaction hash (`payable_revert`) | not run |
-| Result / status | not run |
-| Balance before / after | not run |
-| Transaction hash (`payable_revert_after_write`) | not run |
-| Result / status | not run |
-| Balance before / after | not run |
-| `deposits_total` before / after | not run |
-| `get_times` before / after | not run |
+| Probe contract | `0xf575f1b3b4ec2c861421501a622bceec93ab8cd8` |
+| Sender | `0xcC88888f2eeD5D8e457e6753FAaE64941dc33092` |
+| Transaction | `0x8b1cfbfb3c5ef2b986a17f304d007d6dba83ae667b6cb56ccfdc3fb4a56b6bf9` |
+| Attached value | 1000000000000000 wei |
+| Status | `FINALIZED` (7); round 0, 5 of 5 votes committed and revealed, identical result hashes |
+| Execution result | `txExecutionResult: 2` = `FINISHED_WITH_ERROR` |
+| Trace | `result_code: 1`; `return_data` contains `intentional payable revert` and `UserError`; `stdout`/`stderr` empty; `eq_outputs` empty |
+| GenVM | `v0.2.11-x86_64-linux-release` (genvm_id 5071500) |
+| `balance_now` before / after | `0` / `1000000000000000` |
+| `deposits_total` before / after | `0` / `0` |
+| `get_times` before / after | `[]` / `[]` |
+
+**Proved by L9A:** value attached to a payable method that raises
+`gl.vm.UserError` REMAINS with the contract.
+
+**NOT proved by L9A:** that a state write made before the raise is rolled
+back. `payable_revert` performs no state write at all, so the unchanged
+`deposits_total` and `get_times` only show that nothing was written, not that
+a write would have been undone. L9B (`payable_revert_after_write`) is the leg
+that tests rollback, and **it has not been run**.
+
+Also not observed and not claimed: whether any later mechanism returns the
+retained value.
+
+### Consequence for V3 — decided by the L9A observation
+
+The exact-bond payable `appeal()` interface is **not acceptable**. Any
+validation failure after entry (wrong bond, closed window, appeal already
+used, wrong milestone state, oversized note, attempt-limit failure) would
+leave the worker's value with the contract while the state that would have
+accounted for it is rolled back. That is stranded value outside the internal
+ledger, which the Phase 1 ledger-authority invariant forbids.
+
+Bond intake must therefore be redesigned so that no worker-originated
+value-bearing call can revert on user-controlled validation:
+
+- a payable credit path that records incoming worker value and can only fail
+  on conditions the worker cannot trip accidentally;
+- a non-payable `appeal()` that performs every eligibility check and consumes
+  exactly the required bond from accounted credit;
+- unused or excess credit recoverable by the worker through the existing
+  serialized outflow engine, with its own bounce and redirect rules.
+
+That redesign has its own failure paths (credit accounting in the identity,
+double-spend of credit across milestones, credit stranded at project close)
+and must be reviewed before implementation, not assumed safe.
 
 ### Consequence for V3
 
