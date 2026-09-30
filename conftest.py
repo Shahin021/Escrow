@@ -15,6 +15,28 @@ header `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`.
 
 import pytest
 
+import windows_stdin_compat
+
+# gltest 0.29.2 cannot run Direct Mode on Windows: it unlinks the stdin
+# injection temp file while fd 0 still holds it open, which Windows refuses.
+# The shim defers that delete to the point where gltest restores stdin. It is
+# a no-op on Linux and in CI, which remain authoritative.
+windows_stdin_compat.install()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Report any temp file the shim could not delete, rather than hide it."""
+    leftovers = windows_stdin_compat.finalize()
+
+    if leftovers:
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+
+        if reporter is not None:
+            reporter.write_line(
+                "gltest temp files left behind: " + ", ".join(leftovers)
+            )
+
+
 # Single source of truth for the GenVM release used by Direct Mode tests.
 # CI keys its cache on this value (see .github/workflows/direct-mode-tests.yml).
 GENVM_VERSION = "v0.2.12"
