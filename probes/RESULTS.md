@@ -27,7 +27,7 @@ These contracts are non-production and exist only to answer runtime questions th
 | L7 | `DynArray` / `TreeMap` persistence | PASS |
 | L8 | contract-to-contract emitted message delivery | PASS |
 | L9A | value attached to a payable method that reverts after entry | **RETAINED** (see below) |
-| L9B | rollback of a state write made before the raise | **NOT YET RUN** |
+| L9B | rollback of a state write made before the raise | **VALUE RETAINED, WRITE NOT PERSISTED** |
 
 All live runtime questions required for Phase 0 are closed.
 
@@ -501,7 +501,7 @@ and verified by:
 
 ## L9 — Value attached to a payable method that reverts after entry
 
-Status: **L9A OBSERVED LIVE. L9B not yet run.** Nothing below is inferred.
+Status: **BOTH LEGS OBSERVED LIVE.** Nothing below is inferred.
 
 ### Question
 
@@ -552,16 +552,31 @@ so value behaviour and state rollback are observed separately.
 **Proved by L9A:** value attached to a payable method that raises
 `gl.vm.UserError` REMAINS with the contract.
 
-**NOT proved by L9A:** that a state write made before the raise is rolled
-back. `payable_revert` performs no state write at all, so the unchanged
-`deposits_total` and `get_times` only show that nothing was written, not that
-a write would have been undone. L9B (`payable_revert_after_write`) is the leg
-that tests rollback, and **it has not been run**.
+`payable_revert` performs no state write, so L9A alone could not show
+rollback. That is what L9B adds.
 
-Also not observed and not claimed: whether any later mechanism returns the
-retained value.
+### Result — L9B (`payable_revert_after_write`), observed live
 
-### Consequence for V3 — decided by the L9A observation
+| Observation | Value |
+| --- | --- |
+| Transaction | `0x85569af15649d8852ac42befd03b348c850f974ff88a761139e4d0391b789f7d` |
+| Attached value | 1000000000000000 wei |
+| Status | `FINALIZED`, `txExecutionResult` = `FINISHED_WITH_ERROR` |
+| Trace | contains `intentional payable revert after write`, and **non-empty** `storage_changes` |
+| GenVM | `v0.2.11-x86_64-linux-release` |
+| `balance_now` before / after | `1000000000000000` / `2000000000000000` |
+| `deposits_total` before / after | `0` / `0` |
+| `get_times` before / after | `[]` / `[]` |
+
+**Proved by L9B:** the method's state write (`deposits_total` and
+`get_times`) did **not** persist, while the second 0.001 GEN also remained
+with the contract. The failure mode is therefore asymmetric and demonstrated:
+**value is kept, state is rolled back.**
+
+Still not observed and not claimed: whether any later protocol mechanism ever
+returns the retained value.
+
+### Consequence for V3 — decided by L9A and L9B, implemented
 
 The exact-bond payable `appeal()` interface is **not acceptable**. Any
 validation failure after entry (wrong bond, closed window, appeal already
@@ -580,9 +595,37 @@ value-bearing call can revert on user-controlled validation:
 - unused or excess credit recoverable by the worker through the existing
   serialized outflow engine, with its own bounce and redirect rules.
 
-That redesign has its own failure paths (credit accounting in the identity,
-double-spend of credit across milestones, credit stranded at project close)
-and must be reviewed before implementation, not assumed safe.
+**Implemented on `phase3-fairness`:**
+
+- `fund_appeal_credit()` is payable and performs no check the caller can
+  trip: no milestone, window, status or eligibility condition. Value from
+  anyone other than the worker is routed to the existing unmatched bucket
+  rather than rejected, because rejecting it would strand it exactly as L9
+  demonstrated. The only revert is a zero-value call, where nothing can be
+  stranded.
+- `appeal()` is non-payable. It validates eligibility first and then consumes
+  exactly the required bond from accounted credit, so any revert leaves the
+  credit intact and withdrawable.
+- `withdraw_appeal_credit(amount)` returns unused credit to the worker
+  through the existing serialized outflow engine
+  (`APPEAL_CREDIT_REFUND`). A bounced refund lands in `bounced_held` and is
+  redirectable only by the worker, so a failed refund neither erases the
+  credit nor strands unaccounted value.
+- `close_project()` refuses to close while credit is still held.
+
+Reviewed failure paths, each with a test: every appeal rejection reason
+(non-worker, not final, window closed, oversized note, slot already used)
+leaves credit untouched and still withdrawable; credit cannot be spent twice
+across withdrawal and appeal; invalid withdrawal amounts queue nothing; a
+bounced credit refund stays accounted and worker-owned.
+
+Accounting identity, extended for credit:
+
+```
+funded + credit_received + unmatched_returns
+  == locked + credit_held + bond_held + queued_out + inflight_out
+     + bounced_held + unmatched_held + sent_total
+```
 
 ### Consequence for V3
 

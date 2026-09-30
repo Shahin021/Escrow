@@ -82,11 +82,12 @@ def _identity(escrow):
 
     left = (
         int(acc["funded"])
-        + int(acc["appeal_bonds_received"])
+        + int(acc["appeal_credit_received"])
         + int(acc["unmatched_returns"])
     )
     right = (
         int(acc["locked"])
+        + int(acc["appeal_credit_held"])
         + int(acc["appeal_bond_held"])
         + int(acc["queued_out"])
         + int(acc["inflight_out"])
@@ -160,17 +161,25 @@ def _mock(direct_vm, criteria=None, status=200, body=EVIDENCE):
         )
 
 
+def _credit(direct_vm, escrow, sender, amount):
+    """Fund appeal credit through the payable, check-free intake."""
+    direct_vm.sender = sender
+    direct_vm.value = amount
+
+    try:
+        escrow.fund_appeal_credit()
+    finally:
+        direct_vm.value = 0
+
+
 def _open_appeal(direct_vm, escrow, direct_alice, when=None, bond=BOND):
+    _credit(direct_vm, escrow, direct_alice, bond)
+
     if when is not None:
         set_chain_time(at(when))
 
     direct_vm.sender = direct_alice
-    direct_vm.value = bond
-
-    try:
-        escrow.appeal(0, "please re-check the submit button")
-    finally:
-        direct_vm.value = 0
+    escrow.appeal(0, "please re-check the submit button")
 
 
 # --------------------------------------------------------------- bond maths
@@ -289,32 +298,56 @@ def test_cannot_appeal_before_final_rejection(
     assert _identity(escrow)
 
 
-@pytest.mark.parametrize("bond", [BOND - 1, BOND + 1, 0])
-def test_bond_must_be_exact(
+@pytest.mark.parametrize("credit", [BOND - 1, 0])
+def test_appeal_requires_enough_credit(
     direct_vm,
     direct_deploy,
     direct_owner,
     direct_alice,
-    bond,
+    credit,
 ):
     escrow = _reject_to_final(
         direct_vm, direct_deploy, direct_owner, direct_alice
     )
 
+    if credit:
+        _credit(direct_vm, escrow, direct_alice, credit)
+
     direct_vm.sender = direct_alice
-    direct_vm.value = bond
 
-    try:
-        _expect_revert(
-            "appeal must carry exactly the required bond",
-            lambda: escrow.appeal(0, ""),
-        )
-    finally:
-        direct_vm.value = 0
+    _expect_revert(
+        "insufficient appeal credit for the required bond",
+        lambda: escrow.appeal(0, ""),
+    )
 
+    # appeal() is non-payable and consumes nothing on failure, so whatever
+    # credit exists is still there and still withdrawable.
+    assert escrow.get_appeal_credit_held() == str(credit)
     assert escrow.get_appeal_bond_held() == "0"
     assert escrow.get_milestone_appeal_used(0) is False
     assert escrow.get_milestone_status(0) == "REJECTED_FINAL"
+    assert _identity(escrow)
+
+
+def test_excess_credit_is_kept_not_consumed(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _reject_to_final(
+        direct_vm, direct_deploy, direct_owner, direct_alice
+    )
+
+    _credit(direct_vm, escrow, direct_alice, BOND * 3)
+
+    direct_vm.sender = direct_alice
+    escrow.appeal(0, "")
+
+    # Exactly the bond is consumed; the rest stays as credit.
+    assert escrow.get_appeal_bond_held() == str(BOND)
+    assert escrow.get_appeal_credit_held() == str(BOND * 2)
+    assert escrow.get_milestone_appeal_bond(0) == str(BOND)
     assert _identity(escrow)
 
 

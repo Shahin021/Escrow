@@ -247,6 +247,35 @@ def _iso_to_epoch_seconds(text):
     return total
 
 
+def _parse_amount(raw):
+    """Decimal-string amount, same grammar as the constructor's amounts.
+
+    ASCII digits only (str.isdigit accepts other Unicode digit forms),
+    bounded by MAX_AMOUNT_DIGITS and by u256.
+    """
+    if not isinstance(raw, str):
+        raise gl.vm.UserError("amount must be a decimal string")
+
+    if not _is_ascii_digits(raw):
+        raise gl.vm.UserError("amount must be a decimal string")
+
+    if len(raw) > MAX_AMOUNT_DIGITS:
+        raise gl.vm.UserError("amount has too many digits")
+
+    normalized = raw.lstrip("0") or "0"
+
+    if (
+        len(normalized) > len(MAX_U256_DECIMAL)
+        or (
+            len(normalized) == len(MAX_U256_DECIMAL)
+            and normalized > MAX_U256_DECIMAL
+        )
+    ):
+        raise gl.vm.UserError("amount exceeds u256")
+
+    return int(normalized)
+
+
 def _appeal_bond_for(amount):
     """ceil(amount * APPEAL_BOND_BPS / BPS_DENOMINATOR), integers only.
 
@@ -784,6 +813,13 @@ class ProjectEscrow(gl.Contract):
     total_released: u256
     total_refunded: u256
     # Bond accounting is deliberately separate from escrow principal.
+    # Appeal credit. Worker value is accounted on arrival by a payable path
+    # that performs no eligibility checks, because probe L9 showed that value
+    # attached to a payable method which later raises stays with the contract
+    # while the state that would have recorded it is rolled back.
+    appeal_credit_held: u256
+    total_appeal_credit_received: u256
+    total_appeal_credit_refunded: u256
     total_appeal_bonds_received: u256
     appeal_bond_held: u256
     total_bonds_returned: u256
@@ -873,6 +909,9 @@ class ProjectEscrow(gl.Contract):
 
         self.total_released = u256(0)
         self.total_refunded = u256(0)
+        self.appeal_credit_held = u256(0)
+        self.total_appeal_credit_received = u256(0)
+        self.total_appeal_credit_refunded = u256(0)
         self.total_appeal_bonds_received = u256(0)
         self.appeal_bond_held = u256(0)
         self.total_bonds_returned = u256(0)
@@ -1765,6 +1804,78 @@ class ProjectEscrow(gl.Contract):
         return _checked_deadline(rejected_at, APPEAL_WINDOW_SECONDS)
 
     @gl.public.write.payable
+    def fund_appeal_credit(self) -> None:
+        """Account incoming worker value. Deliberately check-free.
+
+        Probe L9 (probes/RESULTS.md) showed live on Bradbury that value
+        attached to a payable method which then raises gl.vm.UserError stays
+        with the contract while its state write is rolled back. A payable
+        entry point must therefore never revert on anything the caller can
+        trip: no milestone, window, status or eligibility check appears here,
+        and appeal eligibility is decided later by the non-payable appeal().
+
+        Value from anyone other than the worker is routed to the existing
+        unmatched-value bucket rather than rejected, because rejecting it
+        would strand it exactly as L9 demonstrated.
+        """
+        value = gl.message.value
+
+        if value == u256(0):
+            # Nothing was attached, so nothing can be stranded by raising.
+            raise gl.vm.UserError("no value attached")
+
+        if gl.message.sender_address == self.worker:
+            self.appeal_credit_held = u256(
+                self.appeal_credit_held + value
+            )
+            self.total_appeal_credit_received = u256(
+                self.total_appeal_credit_received + value
+            )
+            return
+
+        self.unmatched_returns = u256(
+            self.unmatched_returns + value
+        )
+        self.unmatched_held = u256(
+            self.unmatched_held + value
+        )
+
+    @gl.public.write
+    def withdraw_appeal_credit(self, amount: str) -> None:
+        """Return unused credit to the worker through the outflow engine.
+
+        A bounced refund lands in bounced_held and is redirectable by the
+        worker, exactly like any other outflow it owns, so a failed refund
+        neither erases the credit nor strands unaccounted value.
+        """
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError(
+                "only the worker can withdraw appeal credit"
+            )
+
+        value = _parse_amount(amount)
+
+        if value == 0:
+            raise gl.vm.UserError("amount must be positive")
+
+        if int(self.appeal_credit_held) < value:
+            raise gl.vm.UserError("insufficient appeal credit")
+
+        self.appeal_credit_held = u256(
+            int(self.appeal_credit_held) - value
+        )
+        self.queued_out = u256(self.queued_out + u256(value))
+
+        self.outflow_kinds.append("APPEAL_CREDIT_REFUND")
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(self.worker)
+        self.outflow_amounts.append(u256(value))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
     def appeal(self, milestone_index: int, note: str = "") -> None:
         """One worker appeal of a final rejection, backed by a bond.
 
@@ -1808,25 +1919,29 @@ class ProjectEscrow(gl.Contract):
             self.milestone_amounts[milestone_index]
         )
 
-        if int(gl.message.value) != required:
+        # appeal() is non-payable and consumes already-accounted credit, so a
+        # revert anywhere above leaves that credit untouched and withdrawable
+        # instead of stranding value (probe L9).
+        if int(self.appeal_credit_held) < required:
             raise gl.vm.UserError(
-                "appeal must carry exactly the required bond"
+                "insufficient appeal credit for the required bond"
             )
 
-        # Bond value is tracked separately from escrow principal from the
-        # moment it arrives, so it can never be paid out as a milestone.
-        self.total_appeal_bonds_received = u256(
-            self.total_appeal_bonds_received + gl.message.value
+        # Credit becomes bond atomically: it leaves one bucket and enters the
+        # other in the same statement pair, never counted twice.
+        self.appeal_credit_held = u256(
+            int(self.appeal_credit_held) - required
         )
         self.appeal_bond_held = u256(
-            self.appeal_bond_held + gl.message.value
+            int(self.appeal_bond_held) + required
+        )
+        self.total_appeal_bonds_received = u256(
+            int(self.total_appeal_bonds_received) + required
         )
 
         self.milestone_appeal_used[milestone_index] = u32(1)
         self.milestone_appeal_open[milestone_index] = u32(1)
-        self.milestone_appeal_bond[milestone_index] = u256(
-            gl.message.value
-        )
+        self.milestone_appeal_bond[milestone_index] = u256(required)
         self.milestone_appeal_note[milestone_index] = note
 
         # Append-only: the final rejected attempt is never rewritten.
@@ -2099,7 +2214,7 @@ class ProjectEscrow(gl.Contract):
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
                 )
-        elif kind == "APPEAL_BOND_RETURN":
+        elif kind in ("APPEAL_BOND_RETURN", "APPEAL_CREDIT_REFUND"):
             if gl.message.sender_address != self.worker:
                 raise gl.vm.UserError(
                     "only the worker can redirect this outflow"
@@ -2300,6 +2415,21 @@ class ProjectEscrow(gl.Contract):
 
             self.project_status = "SETTLING"
 
+        elif kind == "APPEAL_CREDIT_REFUND":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Unused credit returned to the worker is neither a milestone
+            # payout nor a principal refund nor a bond outcome.
+            self.total_appeal_credit_refunded = u256(
+                self.total_appeal_credit_refunded + amount
+            )
+
         elif kind == "APPEAL_BOND_RETURN":
             self.outflow_statuses[outflow_id] = "CONFIRMED"
 
@@ -2353,6 +2483,7 @@ class ProjectEscrow(gl.Contract):
             or self.bounced_held != u256(0)
             or self.unmatched_held != u256(0)
             or self.appeal_bond_held != u256(0)
+            or self.appeal_credit_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
@@ -2435,6 +2566,13 @@ class ProjectEscrow(gl.Contract):
                 int(self.total_appeal_bonds_received)
             ),
             "appeal_bond_held": str(int(self.appeal_bond_held)),
+            "appeal_credit_held": str(int(self.appeal_credit_held)),
+            "appeal_credit_received": str(
+                int(self.total_appeal_credit_received)
+            ),
+            "appeal_credit_refunded": str(
+                int(self.total_appeal_credit_refunded)
+            ),
             "bonds_returned": str(int(self.total_bonds_returned)),
             "bonds_forfeited": str(int(self.total_bonds_forfeited)),
         }
@@ -2585,6 +2723,18 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_delivery_windows):
             raise gl.vm.UserError("milestone index out of range")
         return str(self._delivery_deadline(index))
+
+    @gl.public.view
+    def get_appeal_credit_held(self) -> str:
+        return str(int(self.appeal_credit_held))
+
+    @gl.public.view
+    def get_total_appeal_credit_received(self) -> str:
+        return str(int(self.total_appeal_credit_received))
+
+    @gl.public.view
+    def get_total_appeal_credit_refunded(self) -> str:
+        return str(int(self.total_appeal_credit_refunded))
 
     @gl.public.view
     def get_appeal_bond_held(self) -> str:
