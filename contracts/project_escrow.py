@@ -71,8 +71,241 @@ IMPLICIT_CRITERION_TEXT = (
     "agreed milestone specification."
 )
 
+# Phase 3 fairness timing.
+#
+# Time source: gl.message_raw["datetime"], the transaction datetime. This is
+# the only time source the contract uses. It was verified live on Bradbury by
+# probe L2 (probes/RESULTS.md), which observed three monotonically increasing
+# ISO-8601 Z timestamps across three writes. Wall-clock calls such as
+# datetime.now() are deliberately NOT used: they are not established as
+# deterministic across validators, and money depends on this value.
+#
+# Boundary rule, applied uniformly: a deadline action is allowed when
+# now >= deadline, and a window action is allowed while now < expiry.
+SECONDS_PER_DAY = 86400
+REVIEW_STALL_SECONDS = 24 * 3600
+APPEAL_WINDOW_SECONDS = 3 * SECONDS_PER_DAY
+APPEAL_BOND_BPS = 1000
+BPS_DENOMINATOR = 10000
+MAX_APPEAL_NOTE_CHARS = 500
+EVIDENCE_UNAVAILABLE_GRACE_SECONDS = 48 * 3600
+MIN_DELIVERY_WINDOW_SECONDS = 1
+MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
+
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
+
+
+def _is_json_int(value):
+    """Real JSON integer only.
+
+    bool is a subclass of int in Python, and a JSON float or numeric string
+    must not be silently accepted, so each is rejected explicitly.
+    """
+    if value is True or value is False:
+        return False
+
+    return isinstance(value, int)
+
+
+def _days_from_civil(year, month, day):
+    """Days since 1970-01-01, integer arithmetic only (Howard Hinnant)."""
+    y = year
+
+    if month <= 2:
+        y -= 1
+
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+
+    if month > 2:
+        mp = month - 3
+    else:
+        mp = month + 9
+
+    doy = (153 * mp + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+
+    return era * 146097 + doe - 719468
+
+
+def _is_ascii_digits(text):
+    """ASCII 0-9 only.
+
+    str.isdigit() accepts Unicode digit forms such as Arabic-Indic or
+    full-width digits, which int() would then parse into a value the grammar
+    never promised. This timestamp feeds deadlines, so the check is literal
+    and has no locale or Unicode-category dependency.
+    """
+    if len(text) == 0:
+        return False
+
+    for ch in text:
+        if ch < "0" or ch > "9":
+            return False
+
+    return True
+
+
+def _is_leap_year(year):
+    """Gregorian rule, integer arithmetic only."""
+    if year % 4 != 0:
+        return False
+
+    if year % 100 != 0:
+        return True
+
+    return year % 400 == 0
+
+
+def _days_in_month(year, month):
+    if month in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+
+    if month in (4, 6, 9, 11):
+        return 30
+
+    return 29 if _is_leap_year(year) else 28
+
+
+def _iso_to_epoch_seconds(text):
+    """Parse the transaction datetime into integer epoch seconds.
+
+    Grammar, accepted exactly and nothing else:
+
+        YYYY-MM-DDTHH:MM:SS[.<digits>]Z
+
+    The string is validated as supplied: no stripping, so surrounding
+    whitespace is malformed rather than silently tolerated. A fraction must
+    be a dot followed by at least one ASCII digit, and is truncated to whole
+    seconds, so no float ever enters a comparison. Calendar dates are
+    validated per month with the Gregorian leap rule, so 2026-02-29 and
+    2026-04-31 are rejected rather than normalized. Seconds are 00..59:
+    leap-second input was never observed on Bradbury, and clamping 60 to 59
+    would map two distinct timestamps onto one instant. Anything else raises,
+    because a mis-parsed timestamp would move money.
+    """
+    if not isinstance(text, str):
+        raise gl.vm.UserError("transaction datetime is not a string")
+
+    raw = text
+
+    if not raw.endswith("Z"):
+        raise gl.vm.UserError("transaction datetime is not UTC")
+
+    body = raw[:-1]
+
+    if "." in body:
+        body, fraction = body.split(".", 1)
+
+        if not _is_ascii_digits(fraction):
+            raise gl.vm.UserError(
+                "malformed transaction datetime fraction"
+            )
+
+    if len(body) != 19 or body[4] != "-" or body[7] != "-":
+        raise gl.vm.UserError("malformed transaction datetime")
+
+    if body[10] != "T" or body[13] != ":" or body[16] != ":":
+        raise gl.vm.UserError("malformed transaction datetime")
+
+    parts = (
+        body[0:4],
+        body[5:7],
+        body[8:10],
+        body[11:13],
+        body[14:16],
+        body[17:19],
+    )
+
+    for part in parts:
+        if not _is_ascii_digits(part):
+            raise gl.vm.UserError("malformed transaction datetime")
+
+    year = int(parts[0])
+    month = int(parts[1])
+    day = int(parts[2])
+    hour = int(parts[3])
+    minute = int(parts[4])
+    second = int(parts[5])
+
+    if month < 1 or month > 12:
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    if day < 1 or day > _days_in_month(year, month):
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    if hour > 23 or minute > 59 or second > 59:
+        raise gl.vm.UserError("transaction datetime is out of range")
+
+    days = _days_from_civil(year, month, day)
+    total = days * 86400 + hour * 3600 + minute * 60 + second
+
+    if total < 0:
+        raise gl.vm.UserError("transaction datetime precedes the epoch")
+
+    return total
+
+
+def _parse_amount(raw):
+    """Decimal-string amount, same grammar as the constructor's amounts.
+
+    ASCII digits only (str.isdigit accepts other Unicode digit forms),
+    bounded by MAX_AMOUNT_DIGITS and by u256.
+    """
+    if not isinstance(raw, str):
+        raise gl.vm.UserError("amount must be a decimal string")
+
+    if not _is_ascii_digits(raw):
+        raise gl.vm.UserError("amount must be a decimal string")
+
+    if len(raw) > MAX_AMOUNT_DIGITS:
+        raise gl.vm.UserError("amount has too many digits")
+
+    normalized = raw.lstrip("0") or "0"
+
+    if (
+        len(normalized) > len(MAX_U256_DECIMAL)
+        or (
+            len(normalized) == len(MAX_U256_DECIMAL)
+            and normalized > MAX_U256_DECIMAL
+        )
+    ):
+        raise gl.vm.UserError("amount exceeds u256")
+
+    return int(normalized)
+
+
+def _appeal_bond_for(amount):
+    """ceil(amount * APPEAL_BOND_BPS / BPS_DENOMINATOR), integers only.
+
+    Rounding up guarantees a positive bond for every positive milestone
+    amount, so a tiny milestone cannot be appealed for free. Computed as a
+    single multiply then a ceiling division; no float, and the product of a
+    u256 amount stays exact because Python integers are arbitrary precision,
+    while the result is bounded by the amount itself.
+    """
+    value = int(amount)
+
+    if value <= 0:
+        raise gl.vm.UserError("milestone amount must be positive")
+
+    return (
+        value * APPEAL_BOND_BPS + BPS_DENOMINATOR - 1
+    ) // BPS_DENOMINATOR
+
+
+def _checked_deadline(start, window):
+    """start + window with an explicit bound, never wrapping."""
+    if start < 0 or window < 0:
+        raise gl.vm.UserError("negative timing value")
+
+    deadline = start + window
+
+    if deadline > int(MAX_U256_DECIMAL):
+        raise gl.vm.UserError("deadline overflows u256")
+
+    return deadline
 
 
 def _split_sources(raw):
@@ -538,6 +771,27 @@ class ProjectEscrow(gl.Contract):
     # here; get_milestone_rubric_hash already reproduces its identity.
     attempt_criteria_bits: DynArray[str]
 
+    # Phase 3 timing. Both are epoch seconds derived from the transaction
+    # datetime; 0 means "not configured" / "not activated yet". A window is
+    # relative so a locked future milestone cannot age before it is active.
+    milestone_delivery_windows: DynArray[u256]
+    milestone_activated_at: DynArray[u256]
+    # Start of the current review attempt; 0 when not under review.
+    milestone_review_started_at: DynArray[u256]
+    # Start of the CURRENT continuous unavailable episode; 0 when none. A
+    # further unavailable retry must not reset it, or the grace could be
+    # postponed indefinitely.
+    milestone_unavailable_since: DynArray[u256]
+    # Set when a milestone first enters REJECTED_FINAL; 0 otherwise.
+    milestone_final_rejected_at: DynArray[u256]
+    # One appeal per milestone: 0 unused, 1 used (whatever its outcome).
+    milestone_appeal_used: DynArray[u32]
+    # 1 while an appeal adjudication is pending, so an UNAVAILABLE result can
+    # use the ordinary retry path without losing the appeal context.
+    milestone_appeal_open: DynArray[u32]
+    milestone_appeal_bond: DynArray[u256]
+    milestone_appeal_note: DynArray[str]
+
     outflow_kinds: DynArray[str]
     outflow_milestones: DynArray[u32]
     outflow_recipients: DynArray[Address]
@@ -558,6 +812,28 @@ class ProjectEscrow(gl.Contract):
 
     total_released: u256
     total_refunded: u256
+    # Bond accounting is deliberately separate from escrow principal.
+    # Appeal credit. Worker value is accounted on arrival by a payable path
+    # that performs no eligibility checks, because probe L9 showed that value
+    # attached to a payable method which later raises stays with the contract
+    # while the state that would have recorded it is rolled back.
+    appeal_credit_held: u256
+    total_appeal_credit_received: u256
+    total_appeal_credit_refunded: u256
+    # Mutual settlement: one active proposal at a time, replay-protected by a
+    # nonce that moves on every proposal, withdrawal or acceptance.
+    settlement_active: bool
+    settlement_proposer: Address
+    settlement_to_worker: u256
+    settlement_to_client: u256
+    settlement_nonce: u32
+    total_unmatched_swept: u256
+    total_settled_worker: u256
+    total_settled_client: u256
+    total_appeal_bonds_received: u256
+    appeal_bond_held: u256
+    total_bonds_returned: u256
+    total_bonds_forfeited: u256
     sent_total: u256
 
     active_milestone: u32
@@ -643,6 +919,21 @@ class ProjectEscrow(gl.Contract):
 
         self.total_released = u256(0)
         self.total_refunded = u256(0)
+        self.appeal_credit_held = u256(0)
+        self.total_appeal_credit_received = u256(0)
+        self.total_appeal_credit_refunded = u256(0)
+        self.settlement_active = False
+        self.settlement_proposer = Address(bytes(20))
+        self.settlement_to_worker = u256(0)
+        self.settlement_to_client = u256(0)
+        self.settlement_nonce = u32(0)
+        self.total_unmatched_swept = u256(0)
+        self.total_settled_worker = u256(0)
+        self.total_settled_client = u256(0)
+        self.total_appeal_bonds_received = u256(0)
+        self.appeal_bond_held = u256(0)
+        self.total_bonds_returned = u256(0)
+        self.total_bonds_forfeited = u256(0)
         self.sent_total = u256(0)
 
         self.active_milestone = u32(0)
@@ -723,6 +1014,38 @@ class ProjectEscrow(gl.Contract):
             ):
                 raise gl.vm.UserError("too many criteria in project")
 
+            if "delivery_window_seconds" not in raw:
+                delivery_window = 0
+            else:
+                delivery_window = raw["delivery_window_seconds"]
+
+                if not _is_json_int(delivery_window):
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds must be a JSON integer"
+                    )
+
+                if delivery_window < MIN_DELIVERY_WINDOW_SECONDS:
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds must be positive"
+                    )
+
+                if delivery_window > MAX_DELIVERY_WINDOW_SECONDS:
+                    raise gl.vm.UserError(
+                        "delivery_window_seconds is too large"
+                    )
+
+            self.milestone_delivery_windows.append(
+                u256(delivery_window)
+            )
+            self.milestone_activated_at.append(u256(0))
+            self.milestone_review_started_at.append(u256(0))
+            self.milestone_unavailable_since.append(u256(0))
+            self.milestone_final_rejected_at.append(u256(0))
+            self.milestone_appeal_used.append(u32(0))
+            self.milestone_appeal_open.append(u32(0))
+            self.milestone_appeal_bond.append(u256(0))
+            self.milestone_appeal_note.append("")
+
             self.milestone_criteria_start.append(
                 u32(len(self.criterion_texts))
             )
@@ -773,8 +1096,56 @@ class ProjectEscrow(gl.Contract):
         self.locked = u256(self.total_required)
 
         self.project_status = "ACTIVE"
-        self.active_milestone = u32(0)
-        self.milestone_statuses[0] = "AWAITING_DELIVERY"
+        self._activate_milestone(0)
+
+    def _now(self):
+        """The single Phase 3 time source: the transaction datetime.
+
+        Read only on write transactions. Probe L2 observed this field on
+        three live Bradbury writes (record_time); nothing establishes its
+        semantics during a public view call, so no view reads a fresh clock.
+        """
+        return _iso_to_epoch_seconds(gl.message_raw["datetime"])
+
+    def _activate_milestone(self, index):
+        """Open a milestone for delivery and stamp its activation time."""
+        self.active_milestone = u32(index)
+        self.milestone_statuses[index] = "AWAITING_DELIVERY"
+        self.milestone_activated_at[index] = u256(self._now())
+
+    def _delivery_deadline(self, index):
+        """0 when no window is configured or the milestone is not active."""
+        window = int(self.milestone_delivery_windows[index])
+        activated = int(self.milestone_activated_at[index])
+
+        if window == 0 or activated == 0:
+            return 0
+
+        return _checked_deadline(activated, window)
+
+    def _start_review(self, index):
+        """Every new review attempt gets its own stall timer."""
+        self.milestone_statuses[index] = "UNDER_REVIEW"
+        self.milestone_review_started_at[index] = u256(self._now())
+
+    def _stall_eligible_at(self, index):
+        started = int(self.milestone_review_started_at[index])
+
+        if started == 0:
+            return 0
+
+        return _checked_deadline(started, REVIEW_STALL_SECONDS)
+
+    def _unavailable_grace_expiry(self, index):
+        since = int(self.milestone_unavailable_since[index])
+
+        if since == 0:
+            return 0
+
+        return _checked_deadline(
+            since,
+            EVIDENCE_UNAVAILABLE_GRACE_SECONDS,
+        )
 
     def _require_active_milestone(self, index):
         if self.project_status != "ACTIVE":
@@ -873,7 +1244,7 @@ class ProjectEscrow(gl.Contract):
             kind,
         )
 
-        self.milestone_statuses[milestone_index] = "UNDER_REVIEW"
+        self._start_review(milestone_index)
 
     @gl.public.write
     def replace_evidence(
@@ -898,6 +1269,13 @@ class ProjectEscrow(gl.Contract):
                 f"cannot replace evidence from milestone status {status}"
             )
 
+        # An appeal re-judges the evidence that was finally rejected, so the
+        # worker cannot swap the artifact underneath it.
+        if self.milestone_appeal_open[milestone_index] != u32(0):
+            raise gl.vm.UserError(
+                "cannot replace evidence while an appeal is pending"
+            )
+
         # Validate the replacement BEFORE burning a revision. A malformed
         # reference must never consume the worker's revision budget.
         canonical = _check_pinned_url(
@@ -905,11 +1283,38 @@ class ProjectEscrow(gl.Contract):
             self.allowed_sources,
         )
 
+        if status == "EVIDENCE_UNAVAILABLE":
+            current_attempt = int(
+                self.milestone_current_attempt[milestone_index]
+            )
+
+            # Pinned URLs name immutable commits, so the same canonical URL
+            # is the same artifact: that is a retry, not a replacement, and
+            # resolve() already serves it for free as RETRY_UNAVAILABLE.
+            # Allowing it here would let a worker end and restart the
+            # continuous episode at will. Checked before any mutation.
+            if canonical == self.attempt_urls[current_attempt]:
+                raise gl.vm.UserError(
+                    "unavailable evidence replacement must use a "
+                    "different artifact"
+                )
+
         costs_revision = True
         kind = "REPLACE_UNDER_REVIEW"
 
         if status == "EVIDENCE_UNAVAILABLE":
             kind = "REPLACE_UNAVAILABLE"
+
+            # After a continuous unavailable episode outlasts the grace
+            # window, the worker gets one free replacement for THAT episode.
+            # The worker is not punished for an external source that stays
+            # unreachable, and the free replacement cannot be repeated
+            # without a new episode.
+            grace_expiry = self._unavailable_grace_expiry(milestone_index)
+
+            if grace_expiry != 0 and self._now() >= grace_expiry:
+                costs_revision = False
+                kind = "REPLACE_UNAVAILABLE_GRACE"
 
         elif status == "REVIEW_STALLED":
             if self.milestone_stall_free_used[milestone_index] == u32(0):
@@ -938,10 +1343,54 @@ class ProjectEscrow(gl.Contract):
             kind,
         )
 
+        # Replacing the artifact ends any unavailable episode: the new
+        # attempt is a different artifact and starts its own timing.
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+
         if final_rejection:
             self.milestone_statuses[milestone_index] = "REJECTED_FINAL"
+            self.milestone_review_started_at[milestone_index] = u256(0)
+            self.milestone_final_rejected_at[
+                milestone_index
+            ] = u256(self._now())
         else:
-            self.milestone_statuses[milestone_index] = "UNDER_REVIEW"
+            self._start_review(milestone_index)
+
+    @gl.public.write
+    def mark_review_stalled(self, milestone_index: int) -> None:
+        """Deterministic review timeout.
+
+        A review that never reached consensus leaves no on-chain trace, so
+        the only observable is elapsed time. Permissionless: it moves no
+        value, burns no revision and only unlocks the replacement rules the
+        contract already had for REVIEW_STALLED.
+        """
+        self._require_active_milestone(milestone_index)
+
+        # An appeal review uses the same deterministic timer. The appeal
+        # context is carried by milestone_appeal_open, not by the visible
+        # status, so stalling never loses it.
+        if self.milestone_statuses[milestone_index] not in (
+            "UNDER_REVIEW",
+            "UNDER_APPEAL",
+        ):
+            raise gl.vm.UserError(
+                "milestone is not under review"
+            )
+
+        eligible_at = self._stall_eligible_at(milestone_index)
+
+        if eligible_at == 0:
+            raise gl.vm.UserError(
+                "review has no recorded start"
+            )
+
+        if self._now() < eligible_at:
+            raise gl.vm.UserError(
+                "review stall window has not passed"
+            )
+
+        self.milestone_statuses[milestone_index] = "REVIEW_STALLED"
 
     @gl.public.write
     def resolve(self, milestone_index: int) -> None:
@@ -953,6 +1402,7 @@ class ProjectEscrow(gl.Contract):
             "UNDER_REVIEW",
             "EVIDENCE_UNAVAILABLE",
             "REVIEW_STALLED",
+            "UNDER_APPEAL",
         ):
             raise gl.vm.UserError(
                 "milestone is not reviewable"
@@ -1180,6 +1630,69 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "EVIDENCE_UNAVAILABLE"
+
+            # The review attempt is over, so its stall timer must not keep
+            # running: EVIDENCE_UNAVAILABLE cannot be marked stalled, and a
+            # non-zero stall_eligible_at would be observable nonsense.
+            self.milestone_review_started_at[milestone_index] = u256(0)
+
+            # Continuous episode: only the FIRST unavailable result starts
+            # the clock. Further same-URL retries keep the original start, so
+            # retrying cannot postpone the grace window.
+            if self.milestone_unavailable_since[milestone_index] == u256(0):
+                self.milestone_unavailable_since[
+                    milestone_index
+                ] = u256(self._now())
+
+            return
+
+        # Evidence became reviewable and was judged, so any unavailable
+        # episode and the review timer are over.
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+        self.milestone_review_started_at[milestone_index] = u256(0)
+
+        appeal_open = (
+            self.milestone_appeal_open[milestone_index] != u32(0)
+        )
+
+        if appeal_open:
+            # The one allowed appeal is now consumed either way. The rubric,
+            # schema, parser and consensus binding used above are exactly the
+            # Phase 2 ones; only the economics differ.
+            self.milestone_appeal_open[milestone_index] = u32(0)
+
+            if outcome == "APPROVED":
+                self.attempt_verdicts[attempt_index] = "APPROVED"
+                self.milestone_statuses[milestone_index] = "APPROVED"
+
+                # Upheld appeal: the bond goes back to the worker.
+                self._queue_bond_outflow(
+                    milestone_index,
+                    "APPEAL_BOND_RETURN",
+                    self.worker,
+                )
+
+                return
+
+            if outcome != "REJECTED":
+                raise gl.vm.UserError(
+                    "adjudicator returned an unknown outcome"
+                )
+
+            # Denied appeal: the rejection stands, no further revision is
+            # consumed because the milestone was already final, and the bond
+            # is forfeited to the client.
+            self.attempt_verdicts[attempt_index] = "REJECTED"
+            self.milestone_statuses[
+                milestone_index
+            ] = "REJECTED_FINAL"
+
+            self._queue_bond_outflow(
+                milestone_index,
+                "APPEAL_BOND_FORFEIT",
+                self.client,
+            )
+
             return
 
         if outcome == "APPROVED":
@@ -1205,6 +1718,9 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "REJECTED_FINAL"
+            self.milestone_final_rejected_at[
+                milestone_index
+            ] = u256(self._now())
         else:
             self.milestone_statuses[
                 milestone_index
@@ -1252,6 +1768,440 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         return False
+
+    def _queue_refund_for_failed_milestone(self, milestone_index):
+        """The single place principal is returned to the client.
+
+        continue_after_refund == True refunds this milestone's principal
+        only. False stops the project, so every still-locked future milestone
+        is client principal too and the whole remaining locked balance is
+        returned in one outflow; otherwise that funding would be stranded.
+
+        Queueing is not finality: statuses, total_refunded and any
+        progression happen in confirm_outflow, mirroring MILESTONE_PAYOUT.
+        """
+        amount = self.milestone_amounts[milestone_index]
+
+        if self.locked < amount:
+            raise gl.vm.UserError(
+                "internal locked balance is insufficient"
+            )
+
+        if self.continue_after_refund:
+            kind = "MILESTONE_REFUND"
+            refund = amount
+        else:
+            kind = "PROJECT_REMAINDER_REFUND"
+            refund = self.locked
+
+        if refund == u256(0):
+            raise gl.vm.UserError(
+                "refund amount is zero"
+            )
+
+        self.locked = u256(self.locked - refund)
+        self.queued_out = u256(self.queued_out + refund)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(milestone_index))
+        self.outflow_recipients.append(self.client)
+        self.outflow_amounts.append(refund)
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self.milestone_statuses[milestone_index] = "REFUND_PENDING"
+
+        self._emit_one_queued_outflow()
+
+    def _appeal_expiry(self, index):
+        rejected_at = int(self.milestone_final_rejected_at[index])
+
+        if rejected_at == 0:
+            return 0
+
+        return _checked_deadline(rejected_at, APPEAL_WINDOW_SECONDS)
+
+    @gl.public.write.payable
+    def fund_appeal_credit(self) -> None:
+        """Account incoming worker value. Deliberately check-free.
+
+        Probe L9 (probes/RESULTS.md) showed live on Bradbury that value
+        attached to a payable method which then raises gl.vm.UserError stays
+        with the contract while its state write is rolled back. A payable
+        entry point must therefore never revert on anything the caller can
+        trip: no milestone, window, status or eligibility check appears here,
+        and appeal eligibility is decided later by the non-payable appeal().
+
+        Value from anyone other than the worker is routed to the existing
+        unmatched-value bucket rather than rejected, because rejecting it
+        would strand it exactly as L9 demonstrated.
+        """
+        value = gl.message.value
+
+        if value == u256(0):
+            # Nothing was attached, so nothing can be stranded by raising.
+            raise gl.vm.UserError("no value attached")
+
+        # Appeal credit only means something while the project can still be
+        # appealed. Once the project is settling or closed there is nothing
+        # left to bond, and crediting the worker here would let value arriving
+        # after settlement hold the project open indefinitely. Such value is
+        # treated as unattributable and leaves through sweep_unmatched().
+        if (
+            gl.message.sender_address == self.worker
+            and self.project_status == "ACTIVE"
+        ):
+            self.appeal_credit_held = u256(
+                self.appeal_credit_held + value
+            )
+            self.total_appeal_credit_received = u256(
+                self.total_appeal_credit_received + value
+            )
+            return
+
+        self.unmatched_returns = u256(
+            self.unmatched_returns + value
+        )
+        self.unmatched_held = u256(
+            self.unmatched_held + value
+        )
+
+    @gl.public.write
+    def withdraw_appeal_credit(self, amount: str) -> None:
+        """Return unused credit to the worker through the outflow engine.
+
+        A bounced refund lands in bounced_held and is redirectable by the
+        worker, exactly like any other outflow it owns, so a failed refund
+        neither erases the credit nor strands unaccounted value.
+        """
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError(
+                "only the worker can withdraw appeal credit"
+            )
+
+        value = _parse_amount(amount)
+
+        if value == 0:
+            raise gl.vm.UserError("amount must be positive")
+
+        if int(self.appeal_credit_held) < value:
+            raise gl.vm.UserError("insufficient appeal credit")
+
+        self.appeal_credit_held = u256(
+            int(self.appeal_credit_held) - value
+        )
+        self.queued_out = u256(self.queued_out + u256(value))
+
+        self.outflow_kinds.append("APPEAL_CREDIT_REFUND")
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(self.worker)
+        self.outflow_amounts.append(u256(value))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
+    def appeal(self, milestone_index: int, note: str = "") -> None:
+        """One worker appeal of a final rejection, backed by a bond.
+
+        The appeal is a fresh consensus adjudication of the same evidence
+        against the same immutable rubric: resolve() does the judging, using
+        the Phase 2 schema, parser and consensus binding unchanged. The note
+        is bounded metadata for the parties only and never enters the
+        adjudication prompt, so appeal prose cannot influence the verdict.
+        """
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError("only the worker can appeal")
+
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "REJECTED_FINAL":
+            raise gl.vm.UserError(
+                "milestone is not finally rejected"
+            )
+
+        if self.milestone_appeal_used[milestone_index] != u32(0):
+            raise gl.vm.UserError(
+                "milestone has already been appealed"
+            )
+
+        if len(note) > MAX_APPEAL_NOTE_CHARS:
+            raise gl.vm.UserError("appeal note is too long")
+
+        expiry = self._appeal_expiry(milestone_index)
+
+        if expiry == 0:
+            raise gl.vm.UserError(
+                "milestone has no final rejection time"
+            )
+
+        # Window rule: allowed while now < expiry, so an appeal at exactly
+        # the expiry instant is too late.
+        if self._now() >= expiry:
+            raise gl.vm.UserError("appeal window has closed")
+
+        required = _appeal_bond_for(
+            self.milestone_amounts[milestone_index]
+        )
+
+        # appeal() is non-payable and consumes already-accounted credit, so a
+        # revert anywhere above leaves that credit untouched and withdrawable
+        # instead of stranding value (probe L9).
+        if int(self.appeal_credit_held) < required:
+            raise gl.vm.UserError(
+                "insufficient appeal credit for the required bond"
+            )
+
+        # Credit becomes bond atomically: it leaves one bucket and enters the
+        # other in the same statement pair, never counted twice.
+        self.appeal_credit_held = u256(
+            int(self.appeal_credit_held) - required
+        )
+        self.appeal_bond_held = u256(
+            int(self.appeal_bond_held) + required
+        )
+        self.total_appeal_bonds_received = u256(
+            int(self.total_appeal_bonds_received) + required
+        )
+
+        self.milestone_appeal_used[milestone_index] = u32(1)
+        self.milestone_appeal_open[milestone_index] = u32(1)
+        self.milestone_appeal_bond[milestone_index] = u256(required)
+        self.milestone_appeal_note[milestone_index] = note
+
+        # Append-only: the final rejected attempt is never rewritten.
+        current_attempt = int(
+            self.milestone_current_attempt[milestone_index]
+        )
+
+        self._append_attempt(
+            milestone_index,
+            self.attempt_urls[current_attempt],
+            "",
+            "APPEAL_REVIEW",
+        )
+
+        self._start_review(milestone_index)
+        self.milestone_statuses[milestone_index] = "UNDER_APPEAL"
+
+    def _queue_bond_outflow(self, milestone_index, kind, recipient):
+        """Move a held bond into the shared serialized outflow engine."""
+        amount = self.milestone_appeal_bond[milestone_index]
+
+        if amount == u256(0):
+            raise gl.vm.UserError("no appeal bond to move")
+
+        if self.appeal_bond_held < amount:
+            raise gl.vm.UserError(
+                "internal bond balance is insufficient"
+            )
+
+        self.appeal_bond_held = u256(
+            self.appeal_bond_held - amount
+        )
+        self.queued_out = u256(self.queued_out + amount)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(milestone_index))
+        self.outflow_recipients.append(recipient)
+        self.outflow_amounts.append(amount)
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
+
+    def _appeal_failure_reason(self, milestone_index):
+        """Why an open appeal may be aborted, or "" when it may not.
+
+        Only infrastructure failure qualifies: a review that never reached
+        consensus within the stall window, or evidence that stayed
+        continuously unavailable past the grace window. A substantive verdict
+        is never reached this way, so the bond is returned rather than
+        forfeited.
+        """
+        if self.milestone_appeal_open[milestone_index] == u32(0):
+            return ""
+
+        status = self.milestone_statuses[milestone_index]
+        now = self._now()
+
+        if status == "REVIEW_STALLED":
+            return "STALLED"
+
+        if status == "UNDER_APPEAL":
+            eligible_at = self._stall_eligible_at(milestone_index)
+
+            if eligible_at != 0 and now >= eligible_at:
+                return "STALLED"
+
+            return ""
+
+        if status == "EVIDENCE_UNAVAILABLE":
+            expiry = self._unavailable_grace_expiry(milestone_index)
+
+            if expiry != 0 and now >= expiry:
+                return "UNAVAILABLE"
+
+            return ""
+
+        return ""
+
+    def _abort_open_appeal(self, milestone_index):
+        """Close a failed appeal without a substantive verdict.
+
+        The rubric, the evidence and the attempt history are untouched, no
+        revision is burned, the principal stays locked for the later
+        final-rejection path, and the bond goes back to the worker. The
+        appeal slot stays used: one appeal was promised, and an
+        infrastructure abort must not create an unlimited retry loop.
+        """
+        attempt_index = int(
+            self.milestone_current_attempt[milestone_index]
+        )
+
+        # The open APPEAL_REVIEW attempt never produced a verdict. Mark it
+        # terminally rather than leaving it deceptively PENDING. No criteria
+        # bits and no adjudicator reason are fabricated.
+        if self.attempt_verdicts[attempt_index] == "PENDING":
+            self.attempt_verdicts[attempt_index] = "ABORTED"
+
+        self.milestone_appeal_open[milestone_index] = u32(0)
+        self.milestone_review_started_at[milestone_index] = u256(0)
+        self.milestone_unavailable_since[milestone_index] = u256(0)
+        self.milestone_statuses[milestone_index] = "REJECTED_FINAL"
+
+        self._queue_bond_outflow(
+            milestone_index,
+            "APPEAL_BOND_RETURN",
+            self.worker,
+        )
+
+    @gl.public.write
+    def abort_failed_appeal(self, milestone_index: int) -> None:
+        """Worker escape from an appeal that cannot be adjudicated."""
+        if gl.message.sender_address != self.worker:
+            raise gl.vm.UserError(
+                "only the worker can abort an appeal"
+            )
+
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_appeal_open[milestone_index] == u32(0):
+            raise gl.vm.UserError("no appeal is open")
+
+        if self._appeal_failure_reason(milestone_index) == "":
+            raise gl.vm.UserError(
+                "appeal has not failed yet"
+            )
+
+        self._abort_open_appeal(milestone_index)
+
+    @gl.public.write
+    def finalize_rejection(self, milestone_index: int) -> None:
+        """Close out a final rejection once the worker's options are spent.
+
+        A finally rejected milestone must not sit forever. This is the
+        client-side exit, and it is permissionless for the same reason as the
+        other timeouts: every input is contract state plus the transaction
+        datetime, and the value can only follow the refund path to the
+        client, so no caller can influence the outcome.
+
+        Timing:
+          appeal never used   -> only once the appeal window has passed, so
+                                 the worker's right to appeal is preserved
+          appeal resolved     -> immediately; the one allowed appeal is spent
+          appeal still open   -> only if it has failed for infrastructure
+                                 reasons AND its window has passed, in which
+                                 case the bond goes back to the worker first
+        """
+        self._require_active_milestone(milestone_index)
+
+        status = self.milestone_statuses[milestone_index]
+        appeal_used = self.milestone_appeal_used[milestone_index] != u32(0)
+        appeal_open = self.milestone_appeal_open[milestone_index] != u32(0)
+
+        # While an appeal is open the milestone carries the review status of
+        # that appeal, not REJECTED_FINAL, so both shapes are accepted here.
+        if appeal_open:
+            if status not in (
+                "UNDER_APPEAL",
+                "REVIEW_STALLED",
+                "EVIDENCE_UNAVAILABLE",
+            ):
+                raise gl.vm.UserError(
+                    "appeal is in an unexpected state"
+                )
+        elif status != "REJECTED_FINAL":
+            raise gl.vm.UserError(
+                "milestone is not finally rejected"
+            )
+
+        expiry = self._appeal_expiry(milestone_index)
+
+        if expiry == 0:
+            raise gl.vm.UserError(
+                "milestone has no final rejection time"
+            )
+
+        if appeal_open:
+            # The worker may still be waiting for consensus or for the
+            # evidence host, so only an appeal that has demonstrably failed
+            # can be cleared here, and only after the window has passed.
+            if self._appeal_failure_reason(milestone_index) == "":
+                raise gl.vm.UserError(
+                    "appeal is still in progress"
+                )
+
+            if self._now() < expiry:
+                raise gl.vm.UserError(
+                    "appeal window has not passed"
+                )
+
+            # Consensus stalling or an unreachable artifact is not the
+            # worker's fault, so the bond returns rather than being
+            # forfeited. This also re-sets the milestone to REJECTED_FINAL.
+            self._abort_open_appeal(milestone_index)
+        elif not appeal_used:
+            # Boundary rule: a window action is allowed while now < expiry,
+            # so finalizing is allowed from the expiry instant onwards.
+            if self._now() < expiry:
+                raise gl.vm.UserError(
+                    "appeal window has not passed"
+                )
+
+        self._queue_refund_for_failed_milestone(milestone_index)
+
+    @gl.public.write
+    def expire_delivery(self, milestone_index: int) -> None:
+        """Deterministic delivery timeout.
+
+        Permissionless: it moves value only to the client along the same
+        refund path either party could already trigger, and every input is
+        contract state plus the transaction datetime, so no caller can
+        influence the outcome or the recipient.
+        """
+        self._require_active_milestone(milestone_index)
+
+        if self.milestone_statuses[milestone_index] != "AWAITING_DELIVERY":
+            raise gl.vm.UserError(
+                "milestone is not awaiting delivery"
+            )
+
+        deadline = self._delivery_deadline(milestone_index)
+
+        if deadline == 0:
+            raise gl.vm.UserError(
+                "milestone has no delivery deadline"
+            )
+
+        # Boundary rule: a deadline action is allowed when now >= deadline.
+        if self._now() < deadline:
+            raise gl.vm.UserError(
+                "delivery deadline has not passed"
+            )
+
+        self._queue_refund_for_failed_milestone(milestone_index)
 
     @gl.public.write
     def claim_payment(self, milestone_index: int) -> None:
@@ -1354,10 +2304,35 @@ class ProjectEscrow(gl.Contract):
 
         kind = self.outflow_kinds[outflow_id]
 
+        # Only the economic owner of the value may redirect it.
         if kind == "MILESTONE_PAYOUT":
             if gl.message.sender_address != self.worker:
                 raise gl.vm.UserError(
                     "only the worker can redirect this outflow"
+                )
+        elif kind in ("MILESTONE_REFUND", "PROJECT_REMAINDER_REFUND"):
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
+                )
+        elif kind in ("SETTLEMENT_CLIENT", "UNMATCHED_SWEEP"):
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
+                )
+        elif kind in (
+            "APPEAL_BOND_RETURN",
+            "APPEAL_CREDIT_REFUND",
+            "SETTLEMENT_WORKER",
+        ):
+            if gl.message.sender_address != self.worker:
+                raise gl.vm.UserError(
+                    "only the worker can redirect this outflow"
+                )
+        elif kind == "APPEAL_BOND_FORFEIT":
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
                 )
         else:
             raise gl.vm.UserError(
@@ -1414,19 +2389,26 @@ class ProjectEscrow(gl.Contract):
             )
 
         amount = self.outflow_amounts[outflow_id]
-        before = self.outflow_balance_before[outflow_id]
 
-        if before < amount:
-            raise gl.vm.UserError(
-                "invalid outflow balance baseline"
-            )
+        # Expected balance is derived from the ledger, not from a snapshot
+        # taken when the outflow was emitted. A snapshot cannot survive value
+        # arriving in between: anyone could pay in after the emit and block
+        # the confirmation forever, stalling the serialized queue and with it
+        # the whole project. Every arrival is itself recorded in a bucket
+        # (unmatched_held for unattributable value), so the ledger stays the
+        # authority and the exact drop is still required.
+        #
+        # Only this one outflow can be in flight, so inflight_out == amount.
+        expected_after = u256(
+            int(self.locked)
+            + int(self.appeal_credit_held)
+            + int(self.appeal_bond_held)
+            + int(self.queued_out)
+            + int(self.bounced_held)
+            + int(self.unmatched_held)
+        )
 
-        expected_after = u256(before - amount)
-
-        # Confirm an exact native-balance drop of this outflow amount.
-        # Pre-existing unmatched surplus is tolerated because it is already
-        # included in `before`; unexplained extra loss is never accepted.
-        if self.balance == before:
+        if self.balance == u256(int(expected_after) + int(amount)):
             raise gl.vm.UserError(
                 "outflow has not completed yet"
             )
@@ -1438,54 +2420,430 @@ class ProjectEscrow(gl.Contract):
 
         kind = self.outflow_kinds[outflow_id]
 
-        if kind != "MILESTONE_PAYOUT":
-            raise gl.vm.UserError(
-                "unsupported outflow kind"
-            )
-
         milestone_index = int(
             self.outflow_milestones[outflow_id]
         )
 
-        if (
-            self.milestone_statuses[milestone_index]
-            != "PAYMENT_PENDING"
-        ):
-            raise gl.vm.UserError(
-                "milestone is not payment pending"
+        # Dispatch by kind. Each kind verifies its own expected state before
+        # anything is confirmed, and confirmation stays exactly-once.
+        if kind == "MILESTONE_PAYOUT":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "PAYMENT_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not payment pending"
+                )
+
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            self.total_released = u256(
+                self.total_released + amount
             )
 
-        # Confirm exactly once.
-        self.outflow_statuses[outflow_id] = "CONFIRMED"
-
-        self.inflight_out = u256(
-            self.inflight_out - amount
-        )
-        self.sent_total = u256(
-            self.sent_total + amount
-        )
-        self.total_released = u256(
-            self.total_released + amount
-        )
-
-        self.milestone_statuses[
-            milestone_index
-        ] = "RELEASED"
-
-        next_index = milestone_index + 1
-
-        if next_index < len(self.milestone_statuses):
-            self.active_milestone = u32(next_index)
             self.milestone_statuses[
-                next_index
-            ] = "AWAITING_DELIVERY"
-        else:
-            # No work remains. Project closure is explicit so that later
-            # settlement/refund outflows can use the same rule.
+                milestone_index
+            ] = "RELEASED"
+
+            next_index = milestone_index + 1
+
+            if next_index < len(self.milestone_statuses):
+                self._activate_milestone(next_index)
+            else:
+                # No work remains. Project closure is explicit so that later
+                # settlement/refund outflows can use the same rule.
+                self.project_status = "SETTLING"
+
+        elif kind == "MILESTONE_REFUND":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "REFUND_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not refund pending"
+                )
+
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Escrow principal returned to the client. Bond flows added later
+            # in Phase 3 must never be counted here.
+            self.total_refunded = u256(
+                self.total_refunded + amount
+            )
+
+            self.milestone_statuses[
+                milestone_index
+            ] = "REFUNDED"
+
+            # Financial finality first, progression second.
+            next_index = milestone_index + 1
+
+            if next_index < len(self.milestone_statuses):
+                self._activate_milestone(next_index)
+            else:
+                self.project_status = "SETTLING"
+
+        elif kind == "PROJECT_REMAINDER_REFUND":
+            if (
+                self.milestone_statuses[milestone_index]
+                != "REFUND_PENDING"
+            ):
+                raise gl.vm.UserError(
+                    "milestone is not refund pending"
+                )
+
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            self.total_refunded = u256(
+                self.total_refunded + amount
+            )
+
+            self.milestone_statuses[
+                milestone_index
+            ] = "REFUNDED"
+
+            # The project stops here, so every untouched future milestone is
+            # terminal only now that its principal has actually gone back.
+            i = milestone_index + 1
+
+            while i < len(self.milestone_statuses):
+                if self.milestone_statuses[i] == "LOCKED":
+                    self.milestone_statuses[i] = "CANCELLED"
+
+                i += 1
+
             self.project_status = "SETTLING"
+
+        elif kind == "UNMATCHED_SWEEP":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Unattributable value returned to the client is not a principal
+            # refund, so total_refunded is untouched.
+            self.total_unmatched_swept = u256(
+                self.total_unmatched_swept + amount
+            )
+
+        elif kind in ("SETTLEMENT_WORKER", "SETTLEMENT_CLIENT"):
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+
+            # Settlement is its own outcome: it is neither a milestone payout
+            # nor a principal refund, so those totals are untouched.
+            if kind == "SETTLEMENT_WORKER":
+                self.total_settled_worker = u256(
+                    self.total_settled_worker + amount
+                )
+            else:
+                self.total_settled_client = u256(
+                    self.total_settled_client + amount
+                )
+
+        elif kind == "APPEAL_CREDIT_REFUND":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Unused credit returned to the worker is neither a milestone
+            # payout nor a principal refund nor a bond outcome.
+            self.total_appeal_credit_refunded = u256(
+                self.total_appeal_credit_refunded + amount
+            )
+
+        elif kind == "APPEAL_BOND_RETURN":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # A bond return is not a milestone payout: it never touches
+            # total_released.
+            self.total_bonds_returned = u256(
+                self.total_bonds_returned + amount
+            )
+
+        elif kind == "APPEAL_BOND_FORFEIT":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Forfeiture to the client is not a principal refund: it never
+            # touches total_refunded.
+            self.total_bonds_forfeited = u256(
+                self.total_bonds_forfeited + amount
+            )
+
+        else:
+            raise gl.vm.UserError(
+                "unsupported outflow kind"
+            )
 
         # Future phases may queue multiple serialized outflows.
         # If one already exists, emit it after confirming this one.
+        self._emit_one_queued_outflow()
+
+    def _require_settlement_party(self):
+        sender = gl.message.sender_address
+
+        if sender != self.client and sender != self.worker:
+            raise gl.vm.UserError(
+                "only the client or the worker can settle"
+            )
+
+        return sender
+
+    def _require_ledger_idle(self):
+        """Idle means idle in the internal ledger, never in native balance.
+
+        Any outflow still queued, in flight or bounced is already owed to a
+        named recipient, and an open appeal or held bond means bond ownership
+        is unresolved. Settling over either would double-spend.
+        """
+        if (
+            self.queued_out != u256(0)
+            or self.inflight_out != u256(0)
+            or self.bounced_held != u256(0)
+        ):
+            raise gl.vm.UserError(
+                "settlement requires an idle outflow ledger"
+            )
+
+        if self.appeal_bond_held != u256(0):
+            raise gl.vm.UserError(
+                "settlement requires the appeal bond to be resolved"
+            )
+
+        index = 0
+
+        while index < len(self.milestone_statuses):
+            status = self.milestone_statuses[index]
+
+            if status in (
+                "APPROVED",
+                "PAYMENT_PENDING",
+                "REFUND_PENDING",
+            ):
+                raise gl.vm.UserError(
+                    "a milestone is already owed payment or refund"
+                )
+
+            if self.milestone_appeal_open[index] != u32(0):
+                raise gl.vm.UserError(
+                    "settlement requires no open appeal"
+                )
+
+            index += 1
+
+    @gl.public.write
+    def propose_settlement(
+        self,
+        to_worker: str,
+        to_client: str,
+    ) -> None:
+        """Offer a split of the settleable principal.
+
+        The pot is exactly `locked`: unmatched value, appeal credit, appeal
+        bonds and anything already queued, in flight or bounced are excluded,
+        because none of them is unallocated escrow principal.
+        """
+        if self.project_status != "ACTIVE":
+            raise gl.vm.UserError("project is not active")
+
+        proposer = self._require_settlement_party()
+
+        self._require_ledger_idle()
+
+        worker_amount = _parse_amount(to_worker)
+        client_amount = _parse_amount(to_client)
+        pot = int(self.locked)
+
+        if pot == 0:
+            raise gl.vm.UserError("there is no principal to settle")
+
+        if worker_amount + client_amount != pot:
+            raise gl.vm.UserError(
+                "settlement must allocate exactly the locked principal"
+            )
+
+        # A new proposal always moves the nonce, so an earlier one can never
+        # be accepted afterwards.
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.settlement_active = True
+        self.settlement_proposer = proposer
+        self.settlement_to_worker = u256(worker_amount)
+        self.settlement_to_client = u256(client_amount)
+
+    @gl.public.write
+    def withdraw_settlement(self) -> None:
+        """Only the proposer may retract, and the nonce moves again."""
+        if not self.settlement_active:
+            raise gl.vm.UserError("no active settlement proposal")
+
+        if gl.message.sender_address != self.settlement_proposer:
+            raise gl.vm.UserError(
+                "only the proposer can withdraw the proposal"
+            )
+
+        self.settlement_active = False
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.settlement_to_worker = u256(0)
+        self.settlement_to_client = u256(0)
+
+    @gl.public.write
+    def accept_settlement(self, nonce: int) -> None:
+        """Accept the active proposal as the counterparty.
+
+        Acceptance quotes the nonce, so a proposal that was replaced or
+        withdrawn between reading and signing cannot be accepted by mistake.
+        """
+        if self.project_status != "ACTIVE":
+            raise gl.vm.UserError("project is not active")
+
+        if not self.settlement_active:
+            raise gl.vm.UserError("no active settlement proposal")
+
+        accepter = self._require_settlement_party()
+
+        if accepter == self.settlement_proposer:
+            raise gl.vm.UserError(
+                "the proposer cannot accept its own proposal"
+            )
+
+        if not _is_json_int(nonce) or nonce != int(self.settlement_nonce):
+            raise gl.vm.UserError("settlement proposal is stale")
+
+        self._require_ledger_idle()
+
+        worker_amount = int(self.settlement_to_worker)
+        client_amount = int(self.settlement_to_client)
+
+        # The pot may not have moved since the proposal was made.
+        if worker_amount + client_amount != int(self.locked):
+            raise gl.vm.UserError(
+                "settlement no longer matches the locked principal"
+            )
+
+        self.locked = u256(0)
+
+        index = 0
+
+        while index < len(self.milestone_statuses):
+            if self.milestone_statuses[index] not in (
+                "RELEASED",
+                "REFUNDED",
+                "CANCELLED",
+            ):
+                self.milestone_statuses[index] = "CANCELLED"
+
+            index += 1
+
+        # A zero side queues nothing: a zero-value transfer is never emitted.
+        # The agreed split stays visible in storage and the views.
+        if worker_amount > 0:
+            self._queue_settlement_leg(
+                "SETTLEMENT_WORKER",
+                self.worker,
+                worker_amount,
+            )
+
+        if client_amount > 0:
+            self._queue_settlement_leg(
+                "SETTLEMENT_CLIENT",
+                self.client,
+                client_amount,
+            )
+
+        self.settlement_active = False
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.project_status = "SETTLING"
+
+        self._emit_one_queued_outflow()
+
+    def _queue_settlement_leg(self, kind, recipient, amount):
+        self.queued_out = u256(int(self.queued_out) + amount)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(recipient)
+        self.outflow_amounts.append(u256(amount))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+    @gl.public.write
+    def sweep_unmatched(self) -> None:
+        """Return unattributable value to the client.
+
+        Value can reach this contract without a claim attached: a failed
+        emitted message refunding into __on_errored_message__, or someone
+        paying fund_appeal_credit when no appeal credit can exist. It cannot
+        be refused, because probe L9 showed that raising inside a payable
+        method keeps the value while rolling the accounting back.
+
+        The policy is: unattributable value goes to the client, the party
+        that funded the escrow, through the same serialized outflow engine as
+        everything else. Permissionless, because the recipient is fixed and
+        the amount comes from the ledger.
+
+        Callable in any project status, including after CLOSED, and it never
+        changes the status: closing does not discard this value, and value
+        arriving afterwards still has a way out. Closing itself does not
+        depend on this bucket, so paying in cannot block it.
+        """
+        amount = int(self.unmatched_held)
+
+        if amount == 0:
+            raise gl.vm.UserError("there is no unmatched value")
+
+        self.unmatched_held = u256(0)
+        self.queued_out = u256(int(self.queued_out) + amount)
+
+        self.outflow_kinds.append("UNMATCHED_SWEEP")
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(self.client)
+        self.outflow_amounts.append(u256(amount))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
         self._emit_one_queued_outflow()
 
     @gl.public.write
@@ -1500,11 +2858,19 @@ class ProjectEscrow(gl.Contract):
             or self.queued_out != u256(0)
             or self.inflight_out != u256(0)
             or self.bounced_held != u256(0)
-            or self.unmatched_held != u256(0)
+            or self.appeal_bond_held != u256(0)
+            or self.appeal_credit_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
             )
+
+        # unmatched_held is deliberately NOT a closing condition. Nobody can
+        # stop value arriving (refusing it inside a payable method strands it,
+        # per probe L9), so any closing rule that depends on that bucket being
+        # empty is controlled by whoever pays in last: sweep, pay again,
+        # blocked forever. It stays accounted for and sweepable after CLOSED
+        # instead, and closing never discards it.
 
         i = 0
 
@@ -1579,11 +2945,36 @@ class ProjectEscrow(gl.Contract):
             "released": str(int(self.total_released)),
             "refunded": str(int(self.total_refunded)),
             "sent_total": str(int(self.sent_total)),
+            "appeal_bonds_received": str(
+                int(self.total_appeal_bonds_received)
+            ),
+            "appeal_bond_held": str(int(self.appeal_bond_held)),
+            "appeal_credit_held": str(int(self.appeal_credit_held)),
+            "unmatched_swept": str(int(self.total_unmatched_swept)),
+            "settled_worker": str(int(self.total_settled_worker)),
+            "settled_client": str(int(self.total_settled_client)),
+            "appeal_credit_received": str(
+                int(self.total_appeal_credit_received)
+            ),
+            "appeal_credit_refunded": str(
+                int(self.total_appeal_credit_refunded)
+            ),
+            "bonds_returned": str(int(self.total_bonds_returned)),
+            "bonds_forfeited": str(int(self.total_bonds_forfeited)),
         }
 
     @gl.public.view
     def get_outflow_count(self) -> u32:
         return u32(len(self.outflow_statuses))
+
+    @gl.public.view
+    def get_outflow_kind(self, outflow_id: int) -> str:
+        if (
+            outflow_id < 0
+            or outflow_id >= len(self.outflow_kinds)
+        ):
+            raise gl.vm.UserError("outflow index out of range")
+        return self.outflow_kinds[outflow_id]
 
     @gl.public.view
     def get_outflow_status(self, outflow_id: int) -> str:
@@ -1699,6 +3090,168 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_amounts):
             raise gl.vm.UserError("milestone index out of range")
         return str(int(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def get_milestone_delivery_window(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_delivery_windows):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_delivery_windows[index]))
+
+    @gl.public.view
+    def get_milestone_activated_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_activated_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_activated_at[index]))
+
+    @gl.public.view
+    def get_milestone_delivery_deadline(self, index: int) -> str:
+        """0 when no window is configured or the milestone is not active."""
+        if index < 0 or index >= len(self.milestone_delivery_windows):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._delivery_deadline(index))
+
+    @gl.public.view
+    def get_settlement(self) -> dict:
+        """The active proposal, or its cleared form."""
+        return {
+            "active": self.settlement_active,
+            "proposer": self.settlement_proposer.as_hex,
+            "to_worker": str(int(self.settlement_to_worker)),
+            "to_client": str(int(self.settlement_to_client)),
+            "nonce": str(int(self.settlement_nonce)),
+        }
+
+    @gl.public.view
+    def get_total_unmatched_swept(self) -> str:
+        return str(int(self.total_unmatched_swept))
+
+    @gl.public.view
+    def get_total_settled_worker(self) -> str:
+        return str(int(self.total_settled_worker))
+
+    @gl.public.view
+    def get_total_settled_client(self) -> str:
+        return str(int(self.total_settled_client))
+
+    @gl.public.view
+    def get_appeal_credit_held(self) -> str:
+        return str(int(self.appeal_credit_held))
+
+    @gl.public.view
+    def get_total_appeal_credit_received(self) -> str:
+        return str(int(self.total_appeal_credit_received))
+
+    @gl.public.view
+    def get_total_appeal_credit_refunded(self) -> str:
+        return str(int(self.total_appeal_credit_refunded))
+
+    @gl.public.view
+    def get_appeal_bond_held(self) -> str:
+        return str(int(self.appeal_bond_held))
+
+    @gl.public.view
+    def get_total_appeal_bonds_received(self) -> str:
+        return str(int(self.total_appeal_bonds_received))
+
+    @gl.public.view
+    def get_total_bonds_returned(self) -> str:
+        return str(int(self.total_bonds_returned))
+
+    @gl.public.view
+    def get_total_bonds_forfeited(self) -> str:
+        return str(int(self.total_bonds_forfeited))
+
+    @gl.public.view
+    def get_milestone_required_appeal_bond(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_amounts):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(_appeal_bond_for(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def get_milestone_final_rejected_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_final_rejected_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_final_rejected_at[index]))
+
+    @gl.public.view
+    def get_milestone_appeal_expiry(self, index: int) -> str:
+        """0 when the milestone has never been finally rejected."""
+        if index < 0 or index >= len(self.milestone_final_rejected_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._appeal_expiry(index))
+
+    @gl.public.view
+    def get_milestone_appeal_used(self, index: int) -> bool:
+        if index < 0 or index >= len(self.milestone_appeal_used):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_used[index] != u32(0)
+
+    @gl.public.view
+    def get_milestone_appeal_open(self, index: int) -> bool:
+        if index < 0 or index >= len(self.milestone_appeal_open):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_open[index] != u32(0)
+
+    @gl.public.view
+    def get_milestone_appeal_failure_threshold(self, index: int) -> str:
+        """Timestamp from which an open appeal may be aborted, or 0.
+
+        Deterministic stored state only: no view reads the clock, because
+        datetime semantics inside a view call are not runtime-verified.
+        """
+        if index < 0 or index >= len(self.milestone_appeal_open):
+            raise gl.vm.UserError("milestone index out of range")
+
+        if self.milestone_appeal_open[index] == u32(0):
+            return "0"
+
+        status = self.milestone_statuses[index]
+
+        if status == "REVIEW_STALLED":
+            return "0"
+
+        if status == "EVIDENCE_UNAVAILABLE":
+            return str(self._unavailable_grace_expiry(index))
+
+        return str(self._stall_eligible_at(index))
+
+    @gl.public.view
+    def get_milestone_appeal_bond(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_appeal_bond):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_appeal_bond[index]))
+
+    @gl.public.view
+    def get_milestone_appeal_note(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_appeal_note):
+            raise gl.vm.UserError("milestone index out of range")
+        return self.milestone_appeal_note[index]
+
+    @gl.public.view
+    def get_milestone_review_started_at(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_review_started_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_review_started_at[index]))
+
+    @gl.public.view
+    def get_milestone_stall_eligible_at(self, index: int) -> str:
+        """0 when the milestone is not under review."""
+        if index < 0 or index >= len(self.milestone_review_started_at):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._stall_eligible_at(index))
+
+    @gl.public.view
+    def get_milestone_unavailable_since(self, index: int) -> str:
+        if index < 0 or index >= len(self.milestone_unavailable_since):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(int(self.milestone_unavailable_since[index]))
+
+    @gl.public.view
+    def get_milestone_unavailable_grace_expiry(self, index: int) -> str:
+        """0 when no unavailable episode is open."""
+        if index < 0 or index >= len(self.milestone_unavailable_since):
+            raise gl.vm.UserError("milestone index out of range")
+        return str(self._unavailable_grace_expiry(index))
 
     @gl.public.view
     def get_milestone_status(self, index: int) -> str:

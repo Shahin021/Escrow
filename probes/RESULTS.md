@@ -26,8 +26,12 @@ These contracts are non-production and exist only to answer runtime questions th
 | L6 | `web.get` redirect behavior | PASS |
 | L7 | `DynArray` / `TreeMap` persistence | PASS |
 | L8 | contract-to-contract emitted message delivery | PASS |
+| L9A | value attached to a payable method that reverts after entry | **RETAINED** (see below) |
+| L9B | rollback of a state write made before the raise | **VALUE RETAINED, WRITE NOT PERSISTED** |
 
-All live runtime questions required for Phase 0 are now closed.
+All live runtime questions required for Phase 0 are closed.
+
+L9 is a Phase 3 question and is still open. See the section at the end.
 
 ## L1 — Aggregate views and large integers
 
@@ -494,3 +498,143 @@ Selected live evidence is integrity-checked through:
 and verified by:
 
 `probes/verify_selected.py`
+
+## L9 — Value attached to a payable method that reverts after entry
+
+Status: **BOTH LEGS OBSERVED LIVE.** Nothing below is inferred.
+
+### Question
+
+L3 established what happens to value sent to a method-less path and to a
+non-payable method. It did not establish this case:
+
+```
+enter a @gl.public.write.payable method
+-> the method body executes
+-> the contract raises gl.vm.UserError
+```
+
+The Phase 3 appeal bond depends on the answer. `appeal()` is payable and can
+revert after entry for wrong bond amount, a closed appeal window, an appeal
+already used, a wrong milestone state, an oversized note, or an attempt-limit
+failure. If attached value survives such a revert while state rolls back,
+an invalid appeal transaction would strand worker value outside the ledger.
+
+### How to run
+
+```bash
+export GENLAYER_PRIVATE_KEY=0x...
+PROBE_ONLY=L9 PROBE_REUSE_A=<probe A address> PROBE_REUSE_B=<probe B address> \
+    python probes/run_bradbury_probes.py
+```
+
+The step records, for both `payable_revert` and `payable_revert_after_write`:
+contract balance before, the transaction receipt and result, contract balance
+after, and the probe state before and after (`deposits_total`, `get_times`),
+so value behaviour and state rollback are observed separately.
+
+### Result — L9A (`payable_revert`), observed live
+
+| Observation | Value |
+| --- | --- |
+| Probe contract | `0xf575f1b3b4ec2c861421501a622bceec93ab8cd8` |
+| Sender | `0xcC88888f2eeD5D8e457e6753FAaE64941dc33092` |
+| Transaction | `0x8b1cfbfb3c5ef2b986a17f304d007d6dba83ae667b6cb56ccfdc3fb4a56b6bf9` |
+| Attached value | 1000000000000000 wei |
+| Status | `FINALIZED` (7); round 0, 5 of 5 votes committed and revealed, identical result hashes |
+| Execution result | `txExecutionResult: 2` = `FINISHED_WITH_ERROR` |
+| Trace | `result_code: 1`; `return_data` contains `intentional payable revert` and `UserError`; `stdout`/`stderr` empty; `eq_outputs` empty |
+| GenVM | `v0.2.11-x86_64-linux-release` (genvm_id 5071500) |
+| `balance_now` before / after | `0` / `1000000000000000` |
+| `deposits_total` before / after | `0` / `0` |
+| `get_times` before / after | `[]` / `[]` |
+
+**Proved by L9A:** value attached to a payable method that raises
+`gl.vm.UserError` REMAINS with the contract.
+
+`payable_revert` performs no state write, so L9A alone could not show
+rollback. That is what L9B adds.
+
+### Result — L9B (`payable_revert_after_write`), observed live
+
+| Observation | Value |
+| --- | --- |
+| Transaction | `0x85569af15649d8852ac42befd03b348c850f974ff88a761139e4d0391b789f7d` |
+| Attached value | 1000000000000000 wei |
+| Status | `FINALIZED`, `txExecutionResult` = `FINISHED_WITH_ERROR` |
+| Trace | contains `intentional payable revert after write`, and **non-empty** `storage_changes` |
+| GenVM | `v0.2.11-x86_64-linux-release` |
+| `balance_now` before / after | `1000000000000000` / `2000000000000000` |
+| `deposits_total` before / after | `0` / `0` |
+| `get_times` before / after | `[]` / `[]` |
+
+**Proved by L9B:** the method's state write (`deposits_total` and
+`get_times`) did **not** persist, while the second 0.001 GEN also remained
+with the contract. The failure mode is therefore asymmetric and demonstrated:
+**value is kept, state is rolled back.**
+
+Still not observed and not claimed: whether any later protocol mechanism ever
+returns the retained value.
+
+### Consequence for V3 — decided by L9A and L9B, implemented
+
+The exact-bond payable `appeal()` interface is **not acceptable**. Any
+validation failure after entry (wrong bond, closed window, appeal already
+used, wrong milestone state, oversized note, attempt-limit failure) would
+leave the worker's value with the contract while the state that would have
+accounted for it is rolled back. That is stranded value outside the internal
+ledger, which the Phase 1 ledger-authority invariant forbids.
+
+Bond intake must therefore be redesigned so that no worker-originated
+value-bearing call can revert on user-controlled validation:
+
+- a payable credit path that records incoming worker value and can only fail
+  on conditions the worker cannot trip accidentally;
+- a non-payable `appeal()` that performs every eligibility check and consumes
+  exactly the required bond from accounted credit;
+- unused or excess credit recoverable by the worker through the existing
+  serialized outflow engine, with its own bounce and redirect rules.
+
+**Implemented on `phase3-fairness`:**
+
+- `fund_appeal_credit()` is payable and performs no check the caller can
+  trip: no milestone, window, status or eligibility condition. Value from
+  anyone other than the worker is routed to the existing unmatched bucket
+  rather than rejected, because rejecting it would strand it exactly as L9
+  demonstrated. The only revert is a zero-value call, where nothing can be
+  stranded.
+- `appeal()` is non-payable. It validates eligibility first and then consumes
+  exactly the required bond from accounted credit, so any revert leaves the
+  credit intact and withdrawable.
+- `withdraw_appeal_credit(amount)` returns unused credit to the worker
+  through the existing serialized outflow engine
+  (`APPEAL_CREDIT_REFUND`). A bounced refund lands in `bounced_held` and is
+  redirectable only by the worker, so a failed refund neither erases the
+  credit nor strands unaccounted value.
+- `close_project()` refuses to close while credit is still held.
+
+Reviewed failure paths, each with a test: every appeal rejection reason
+(non-worker, not final, window closed, oversized note, slot already used)
+leaves credit untouched and still withdrawable; credit cannot be spent twice
+across withdrawal and appeal; invalid withdrawal amounts queue nothing; a
+bounced credit refund stays accounted and worker-owned.
+
+Accounting identity, extended for credit:
+
+```
+funded + credit_received + unmatched_returns
+  == locked + credit_held + bond_held + queued_out + inflight_out
+     + bounced_held + unmatched_held + sent_total
+```
+
+### Consequence for V3
+
+To be filled from the observation:
+
+- **If value is rolled back on a payable UserError:** the exact-bond
+  `appeal()` interface is safe, and its safety note must cite L9 rather
+  than L3.
+- **If value can remain in the contract:** the exact-value revert path is
+  not acceptable and bond intake must be redesigned (for example a payable
+  credit path plus a non-payable `appeal()` that consumes accounted credit,
+  with unused credit recoverable through the serialized outflow engine).

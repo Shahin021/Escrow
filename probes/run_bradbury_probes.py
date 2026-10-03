@@ -16,10 +16,20 @@ Optional environment:
     PROBE_EOA_RECIPIENT  L5 recipient (default: the owner's own address)
     PROBE_POLL_SECONDS   polling interval (default 15)
     PROBE_POLL_MINUTES   max polling per probe after finalization (default 20)
-    PROBE_ONLY           comma list to run a subset, e.g. "L1,L7" (deploy always runs)
+    PROBE_ONLY           comma list to run a subset, e.g. "L1,L7" or "L9B"
     PROBE_REUSE_A / PROBE_REUSE_B   reuse already-deployed probe addresses
+    PROBE_INSPECT        1 = read-only: views and PROBE_TX receipts only, no
+                         transaction is ever submitted
+    PROBE_TX             comma list of existing transaction hashes to fetch
+                         receipts and traces for
+    PROBE_RESULTS_DIR    where observation files are written (default
+                         probes/results). Point it elsewhere for dry runs.
+    PROBE_CHECKPOINT     path to the checkpoint file (default
+                         probes/results/checkpoint.json). A write whose step
+                         is already recorded there is never resubmitted; its
+                         existing transaction is re-read instead.
 
-Spend: 2 deploys + ~15 transactions + 3 units deposited (default 0.003 GEN),
+Spend: 2 deploys + ~18 transactions + 3 units deposited (default 0.003 GEN),
 of which 1 unit goes to PROBE_EOA_RECIPIENT and up to 1 unit may remain in
 probe B. Bradbury testnet GEN only.
 """
@@ -35,11 +45,14 @@ from pathlib import Path
 from genlayer_py import create_account, create_client
 from genlayer_py.chains import testnet_bradbury
 from genlayer_py.types import TransactionStatus
+from genlayer_py.types.transactions import TRANSACTION_STATUS_NUMBER_TO_NAME
 import requests
 
 HERE = Path(__file__).resolve().parent
 CONTRACT = HERE / "runtime_probe.py"
-RESULTS_DIR = HERE / "results"
+# Overridable so a dry run against a stub client cannot write files into the
+# committed evidence directory.
+RESULTS_DIR = Path(os.environ.get("PROBE_RESULTS_DIR", str(HERE / "results")))
 
 L6_URLS = {
     "github_redirect": "https://github.com/Shahin021/Escrow/raw/4fefef6a1d790a2fb39a62a937e76852c6cb778c/evidence/nova_valid.html",
@@ -49,8 +62,30 @@ L6_URLS = {
 
 UNIT = int(os.environ.get("PROBE_UNIT_WEI", str(10**15)))
 POLL_S = int(os.environ.get("PROBE_POLL_SECONDS", "15"))
+ACCEPT_WAIT_SECONDS = int(os.environ.get("PROBE_ACCEPT_WAIT_SECONDS", str(10 * 60)))
+FINALIZE_WAIT_SECONDS = int(os.environ.get("PROBE_FINALIZE_WAIT_SECONDS", str(45 * 60)))
 POLL_MIN = int(os.environ.get("PROBE_POLL_MINUTES", "20"))
 ONLY = {x.strip() for x in os.environ.get("PROBE_ONLY", "").split(",") if x.strip()}
+INSPECT = os.environ.get("PROBE_INSPECT", "") not in ("", "0", "false")
+KNOWN_TXS = [x.strip() for x in os.environ.get("PROBE_TX", "").split(",") if x.strip()]
+CHECKPOINT_PATH = Path(
+    os.environ.get(
+        "PROBE_CHECKPOINT",
+        str(HERE / "results" / "checkpoint.json"),
+    )
+)
+
+
+def load_checkpoint():
+    if CHECKPOINT_PATH.exists():
+        return json.loads(CHECKPOINT_PATH.read_text())
+
+    return {}
+
+
+def save_checkpoint(data):
+    CHECKPOINT_PATH.parent.mkdir(exist_ok=True)
+    CHECKPOINT_PATH.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
 def now() -> str:
@@ -171,128 +206,105 @@ def main() -> int:
         return not ONLY or p in ONLY
 
     def wait(tx_hash, status, probe, label):
+        """Poll for a transaction status using only verified SDK calls.
+
+        client.get_transaction() is what the SDK's own
+        wait_for_transaction_receipt polls, and TRANSACTION_STATUS_NUMBER_TO_NAME
+        is the SDK's own mapping. No hand-written gen_* RPC method is used
+        here: an unsupported method name (as gen_getTransactionLifecycle
+        turned out to be) would fail silently or mislead.
+
+        Every wait is bounded in wall-clock time, so the runner cannot hang;
+        a timeout is recorded as an observation, not raised.
+        """
         t0 = time.time()
-        rpc_url = "https://rpc-bradbury.genlayer.com"
         wanted = status.value.upper()
-
-        # Bradbury finalization can take a while, but every individual HTTP
-        # request must have a bounded timeout so the runner cannot hang.
-        max_seconds = 45 * 60 if wanted == "FINALIZED" else 5 * 60
-        deadline = time.time() + max_seconds
-        last_seen = None
-        last_report = 0.0
-        last_error = None
-
+        max_seconds = FINALIZE_WAIT_SECONDS if wanted == "FINALIZED" else ACCEPT_WAIT_SECONDS
+        deadline = t0 + max_seconds
         acceptable = {
             "ACCEPTED": {"ACCEPTED", "FINALIZED"},
             "FINALIZED": {"FINALIZED"},
         }[wanted]
+        last_seen = None
+        last_error = None
 
         while time.time() < deadline:
             try:
-                status_resp = requests.post(
-                    rpc_url,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "gen_getTransactionStatus",
-                        "params": [{"txId": str(tx_hash)}],
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "genlayer-py",
-                    },
-                    timeout=(5, 15),
-                )
-                status_resp.raise_for_status()
-                payload = status_resp.json()
+                transaction = client.get_transaction(transaction_hash=tx_hash)
+                raw_status = str(transaction.get("status"))
+                seen = TRANSACTION_STATUS_NUMBER_TO_NAME.get(raw_status)
+                seen = seen.value.upper() if seen is not None else raw_status.upper()
 
-                if payload.get("error"):
-                    raise RuntimeError(f"status RPC error: {payload['error']}")
-
-                info = payload.get("result") or {}
-                seen = str(info.get("status") or "").upper()
-
-                now_ts = time.time()
-                if seen != last_seen or now_ts - last_report >= 30:
-                    print(
-                        f"[{now()}] {probe} {label}: waiting for {wanted}; "
-                        f"network_status={seen or 'UNKNOWN'}"
-                    )
+                if seen != last_seen:
+                    print(f"[{now()}] {probe} {label}: status={seen}")
                     last_seen = seen
-                    last_report = now_ts
-
-                if seen in {"CANCELED", "CANCELLED", "UNDETERMINED"}:
-                    rec.add(
-                        probe,
-                        f"{label}:{wanted}:ERROR",
-                        tx=str(tx_hash),
-                        seconds=round(time.time() - t0, 1),
-                        error=f"terminal network status: {seen}",
-                        status_response=info,
-                    )
-                    return None
 
                 if seen in acceptable:
-                    receipt_resp = requests.post(
-                        rpc_url,
-                        json={
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "method": "gen_getTransactionReceipt",
-                            "params": [{"txId": str(tx_hash)}],
-                        },
-                        headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "genlayer-py",
-                    },
-                    timeout=(5, 15),
-                    )
-                    receipt_resp.raise_for_status()
-                    receipt_payload = receipt_resp.json()
-
-                    if receipt_payload.get("error"):
-                        raise RuntimeError(
-                            f"receipt RPC error: {receipt_payload['error']}"
-                        )
-
-                    receipt = receipt_payload.get("result")
-                    if receipt is None:
-                        raise RuntimeError("receipt RPC returned null")
-
                     rec.add(
                         probe,
                         f"{label}:{wanted}",
                         tx=str(tx_hash),
                         seconds=round(time.time() - t0, 1),
-                        receipt=receipt,
+                        receipt=transaction,
                     )
-                    return receipt
+                    return transaction
 
-                last_error = None
-
+                if seen in {"CANCELED", "CANCELLED", "UNDETERMINED"}:
+                    rec.add(
+                        probe,
+                        f"{label}:{wanted}:TERMINAL",
+                        tx=str(tx_hash),
+                        seconds=round(time.time() - t0, 1),
+                        observed_status=seen,
+                        receipt=transaction,
+                    )
+                    return None
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
-                now_ts = time.time()
-                if now_ts - last_report >= 30:
-                    print(
-                        f"[{now()}] {probe} {label}: transient RPC error: "
-                        f"{last_error}"
-                    )
-                    last_report = now_ts
+                print(f"[{now()}] {probe} {label}: transient error: {last_error}")
 
-            time.sleep(5)
+            # Never below one second, so a misconfigured interval cannot
+            # turn the bounded wait into a hot loop against the RPC.
+            time.sleep(max(POLL_S, 1))
 
         rec.add(
             probe,
-            f"{label}:{wanted}:ERROR",
+            f"{label}:{wanted}:TIMEOUT",
             tx=str(tx_hash),
             seconds=round(time.time() - t0, 1),
-            error=f"timeout waiting for {wanted}; last_error={last_error}",
+            last_observed_status=last_seen,
+            last_error=last_error,
+            note=(
+                "bounded wait elapsed; re-run with the same PROBE_CHECKPOINT "
+                "to resume without resubmitting"
+            ),
         )
+
         return None
 
-    def write(probe, address, fn, args=None, value=0, final=True):
+    checkpoint = load_checkpoint()
+
+    def write(probe, address, fn, args=None, value=0, final=True, step_key=None):
+        key = step_key or f"{probe}:{address}:{fn}:{value}"
+
+        # A step recorded in the checkpoint is never resubmitted: a crashed or
+        # interrupted run resumes by re-reading its transaction instead of
+        # spending value again.
+        if key in checkpoint:
+            h = checkpoint[key]
+            rec.add(
+                probe,
+                f"write {fn}:already submitted",
+                tx=str(h),
+                key=key,
+            )
+            wait(h, TransactionStatus.FINALIZED, probe, f"write {fn}")
+            return h
+
+        if INSPECT:
+            rec.add(probe, f"write {fn}:SKIPPED (inspect mode)", key=key)
+            return None
+
         try:
             h = client.write_contract(
                 address=address,
@@ -310,12 +322,16 @@ def main() -> int:
             )
             return None
 
+        checkpoint[key] = str(h)
+        save_checkpoint(checkpoint)
+
         rec.add(
             probe,
             f"write {fn}:submitted",
             tx=str(h),
             args=args or [],
             value=str(value),
+            key=key,
         )
 
         accepted = wait(
@@ -381,6 +397,11 @@ def main() -> int:
     code = CONTRACT.read_text()
     addrs = {}
     for name, env in (("A", "PROBE_REUSE_A"), ("B", "PROBE_REUSE_B")):
+        if INSPECT and not os.environ.get(env):
+            rec.add("deploy", f"skip {name} (inspect mode, no reuse address)")
+            addrs[name] = ""
+            continue
+
         if os.environ.get(env):
             addrs[name] = os.environ[env]
             rec.add("deploy", f"reuse {name}", address=addrs[name])
@@ -564,6 +585,54 @@ def main() -> int:
             rec.add("L6", f"url {label}", url=url)
             write("L6", A, "fetch", [url], final=False)
         read("L6", A, "get_fetches")
+
+    # ---- known transactions: receipts for work already submitted ----------------------------
+    for tx in KNOWN_TXS:
+        wait(tx, TransactionStatus.FINALIZED, "known_tx", f"receipt {tx[:12]}")
+
+        try:
+            rec.add(
+                "known_tx",
+                f"trace {tx[:12]}",
+                trace=client.debug_trace_transaction(transaction_hash=tx),
+            )
+        except Exception as e:
+            rec.add("known_tx", f"trace {tx[:12]}:ERROR", error=f"{type(e).__name__}: {e}")
+
+    # ---- L9: payable method that reverts after entry ---------------------------------------
+    #
+    # Two independent legs so either can be run alone:
+    #   L9A  payable_revert                (no state write before raising)
+    #   L9B  payable_revert_after_write    (state write, then raise)
+    # Every read is recorded around each leg, because a later leg changes the
+    # balance and the legs must not be conflated.
+    if want("L9") or want("L9A"):
+        read("L9A", A, "balance_now", label="balance_before_leg1")
+        read("L9A", A, "deposits_total", label="deposits_before_leg1")
+        read("L9A", A, "get_times", label="times_before_leg1")
+
+        write("L9A", A, "payable_revert", value=UNIT, step_key="L9A:payable_revert")
+
+        read("L9A", A, "balance_now", label="balance_after_leg1")
+        read("L9A", A, "deposits_total", label="deposits_after_leg1")
+        read("L9A", A, "get_times", label="times_after_leg1")
+
+    if want("L9") or want("L9B"):
+        read("L9B", A, "balance_now", label="balance_before_leg2")
+        read("L9B", A, "deposits_total", label="deposits_before_leg2")
+        read("L9B", A, "get_times", label="times_before_leg2")
+
+        write(
+            "L9B",
+            A,
+            "payable_revert_after_write",
+            value=UNIT,
+            step_key="L9B:payable_revert_after_write",
+        )
+
+        read("L9B", A, "balance_now", label="balance_after_leg2")
+        read("L9B", A, "deposits_total", label="deposits_after_leg2")
+        read("L9B", A, "get_times", label="times_after_leg2")
 
     # ---- L8: contract-to-contract message -----------------------------------------------------
     if want("L8"):

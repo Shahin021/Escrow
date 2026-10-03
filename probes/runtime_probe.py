@@ -16,6 +16,7 @@ the runtime treats value sent to such a contract.
   L4  bounced transfer callback          send_to(B) + __on_errored_message__
   L5  balance after emit_transfer        send_to(EOA) + balance_now
   L6  web.get redirect behaviour         fetch / get_fetches
+  L9  payable method that reverts        payable_revert / payable_revert_after_write
   L7  records in DynArray / TreeMap      store / load
   L8  contract-to-contract message       ping / pong / get_pings
 """
@@ -132,6 +133,24 @@ class RuntimeProbe(gl.Contract):
     @gl.public.view
     def bounced_total_str(self) -> str:
         return str(int(self.bounced_total))
+
+    # ---- L9: payable method that reverts after entry ------------------------
+    #
+    # L3 answered what happens to value sent to a method-less path or to a
+    # NON-payable method. It did not answer this: value is accepted by a
+    # payable method, the method body runs, and then the contract raises.
+    # The escrow's appeal bond depends on the answer.
+    @gl.public.write.payable
+    def payable_revert(self) -> None:
+        raise gl.vm.UserError("intentional payable revert")
+
+    @gl.public.write.payable
+    def payable_revert_after_write(self) -> None:
+        # Records both the value behaviour and whether the state write is
+        # rolled back with the revert.
+        self.deposits = u256(self.deposits + gl.message.value)
+        self.times.append("payable_revert_after_write")
+        raise gl.vm.UserError("intentional payable revert after write")
 
     # ---- L6: web.get ---------------------------------------------------------
     @gl.public.write
