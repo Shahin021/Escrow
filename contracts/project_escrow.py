@@ -92,6 +92,11 @@ EVIDENCE_UNAVAILABLE_GRACE_SECONDS = 48 * 3600
 MIN_DELIVERY_WINDOW_SECONDS = 1
 MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
 
+# Stable identifier for the read interface other contracts and tools code
+# against. Any change to the shape of the interface views below requires a new
+# id, never a silent redefinition of this one.
+ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v1"
+
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
 
@@ -2887,6 +2892,48 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         self.project_status = "CLOSED"
+
+    @gl.public.view
+    def interface_id(self) -> str:
+        """Identifies the read interface, so a consumer can refuse unknown
+        versions rather than guess at field meanings."""
+        return ESCROW_INTERFACE_ID
+
+    @gl.public.view
+    def is_milestone_released(self, index: int) -> bool:
+        """True only for a milestone whose payout is confirmed sent."""
+        if index < 0 or index >= len(self.milestone_statuses):
+            raise gl.vm.UserError("milestone index out of range")
+
+        return self.milestone_statuses[index] == "RELEASED"
+
+    @gl.public.view
+    def released_amount(self, index: int) -> str:
+        """Decimal string. Zero unless the milestone reached RELEASED, so a
+        consumer can never read an amount that has not actually been paid."""
+        if index < 0 or index >= len(self.milestone_statuses):
+            raise gl.vm.UserError("milestone index out of range")
+
+        if self.milestone_statuses[index] != "RELEASED":
+            return "0"
+
+        return str(int(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def parties(self) -> dict:
+        """Fixed-shape summary. Amounts are decimal strings, because a JS
+        consumer would otherwise receive a Number for small values and a
+        string for large ones (probe L1)."""
+        return {
+            "interface_id": ESCROW_INTERFACE_ID,
+            "client": self.client.as_hex,
+            "worker": self.worker.as_hex,
+            "project_status": self.project_status,
+            "milestone_count": str(len(self.milestone_statuses)),
+            "total_funded": str(int(self.total_funded)),
+            "total_released": str(int(self.total_released)),
+            "total_refunded": str(int(self.total_refunded)),
+        }
 
     @gl.public.view
     def get_project_status(self) -> str:
