@@ -49,10 +49,15 @@ forward to later commits.
 | Linux | `2f107c6` | 356 / 356 passed | 9 / 9 passed | 2026-10-03 |
 | Linux | `1a6c24d` | 369 / 369 passed | 9 / 9 passed | 2026-10-03 |
 | Windows | `1a6c24d` | 369 / 369 passed, finalization 13 / 13 | 9 / 9 passed | 2026-10-03 |
+| Linux | `d9526e9` (Phase 3 freeze) | 416 / 416 passed | 9 / 9 passed | 2026-10-03 |
+| Windows | `d9526e9` (Phase 3 freeze) | 416 / 416 passed, 0 failed, 0 skipped, in 13.00s | included in the suite | 2026-10-03 |
 
-Both platforms are verified at `1a6c24d`, which includes
-`finalize_rejection` and its 13 tests. Later commits are verified on Linux
-until a Windows run is recorded for them.
+The frozen Phase 3 code at `d9526e9` is verified on both platforms. The
+Windows run used `.\.venv\Scripts\python.exe -m pytest -q`.
+
+The earlier `1a6c24d` and `2f107c6` rows are historical: each covers only the
+code at that commit, and neither covers the frozen tree. Commits made after
+`d9526e9` are unverified on both platforms until their own run is recorded.
 
 ## Windows support
 
