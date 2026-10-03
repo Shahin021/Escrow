@@ -47,12 +47,12 @@ forward to later commits.
 | --- | --- | --- | --- | --- |
 | Windows | `2f107c6` | 356 / 356 passed | 9 / 9 passed | 2026-10-03 |
 | Linux | `2f107c6` | 356 / 356 passed | 9 / 9 passed | 2026-10-03 |
-| Linux | `62a115d` + finalization tests | 369 / 369 passed | 9 / 9 passed | 2026-10-03 |
+| Linux | `1a6c24d` | 369 / 369 passed | 9 / 9 passed | 2026-10-03 |
+| Windows | `1a6c24d` | 369 / 369 passed, finalization 13 / 13 | 9 / 9 passed | 2026-10-03 |
 
-**Not yet verified on Windows:** the current branch. The Windows run covers
-`2f107c6`, which is the commit that fixed the shim tests. `finalize_rejection`
-and its 13 tests landed afterwards, so the 369-test suite has only been run
-on Linux. Windows coverage of the current tree is outstanding.
+Both platforms are verified at `1a6c24d`, which includes
+`finalize_rejection` and its 13 tests. Later commits are verified on Linux
+until a Windows run is recorded for them.
 
 ## Windows support
 
