@@ -127,8 +127,10 @@ def test_deferred_delete_happens_after_stdin_restore(monkeypatch):
 def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
     """A concurrent delete elsewhere in the process must happen at once.
 
-    This is the property the previous os.unlink interception could not
-    offer: during injection, another thread's unrelated unlink had to wait.
+    The overlap is forced, not hoped for: injection is held open inside
+    tempfile.mkstemp until the other thread has actually unlinked its file,
+    so the unrelated delete provably happens while injection is in flight.
+    This is the property the previous os.unlink interception could not offer.
     """
     import tempfile
     import threading
@@ -140,18 +142,37 @@ def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
     fd, unrelated = tempfile.mkstemp()
     os.close(fd)
 
-    deleted_during_injection = threading.Event()
-    injecting = threading.Event()
+    injection_started = threading.Event()
+    unrelated_deleted = threading.Event()
     failure = []
 
+    real_mkstemp = tempfile.mkstemp
+
+    def gated_mkstemp(*args, **kwargs):
+        made = real_mkstemp(*args, **kwargs)
+
+        # Injection is now underway and the stdin temp file exists. Hold it
+        # here until the other thread's unlink has completed.
+        injection_started.set()
+
+        if not unrelated_deleted.wait(timeout=5):
+            failure.append(TimeoutError("unrelated delete did not complete"))
+
+        return made
+
+    monkeypatch.setattr(tempfile, "mkstemp", gated_mkstemp)
+
     def deleter():
-        injecting.wait(timeout=5)
+        if not injection_started.wait(timeout=5):
+            failure.append(TimeoutError("injection never started"))
+            return
 
         try:
             os.unlink(unrelated)
-            deleted_during_injection.set()
         except Exception as error:  # pragma: no cover - diagnostic only
             failure.append(error)
+        finally:
+            unrelated_deleted.set()
 
     thread = threading.Thread(target=deleter)
     thread.start()
@@ -159,20 +180,19 @@ def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
     saved_stdin = os.dup(0)
 
     try:
-        injecting.set()
         compat._write_encoded_to_fd0(_fake_vm(), b"encoded-message")
 
         thread.join(timeout=5)
 
-        assert not failure, f"unrelated delete raised: {failure}"
-        assert deleted_during_injection.is_set()
+        assert not failure, f"concurrency failed: {failure}"
+        assert unrelated_deleted.is_set()
         assert not os.path.exists(unrelated), (
-            "an unrelated file deleted by another thread must be gone "
-            "immediately, not deferred"
+            "an unrelated file deleted by another thread mid-injection must "
+            "be gone immediately, not deferred"
         )
 
-        # Meanwhile the stdin temp file is still deferred, and only dies
-        # after fd 0 is restored.
+        # Meanwhile the stdin temp file is still deferred and only dies once
+        # fd 0 has been restored.
         stdin_temp = compat._PENDING[-1]
 
         assert os.path.exists(stdin_temp)
@@ -188,6 +208,29 @@ def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
 
         if os.path.exists(unrelated):
             os.unlink(unrelated)
+
+
+def test_install_refuses_to_run_against_a_changed_gltest(monkeypatch):
+    """A drift mismatch must stop the suite, not warn and carry on."""
+    from gltest.direct import loader
+
+    monkeypatch.setenv("ESCROW_FORCE_WINDOWS_STDIN_COMPAT", "1")
+    monkeypatch.setattr(compat, "UPSTREAM_SOURCE_SHA256", "0" * 64)
+    monkeypatch.setattr(compat, "_ACTIVE", False)
+
+    before = loader._inject_message_to_fd0
+
+    try:
+        compat.install()
+    except RuntimeError as error:
+        assert "re-sync" in str(error).lower() or "differs" in str(error)
+    else:
+        raise AssertionError("install() must raise on an upstream mismatch")
+
+    # Nothing was installed, so the suite cannot silently run on a mirror
+    # that was never reconciled.
+    assert loader._inject_message_to_fd0 is before
+    assert compat.is_active() is False
 
 
 def test_undeletable_file_is_reported_not_hidden(monkeypatch):

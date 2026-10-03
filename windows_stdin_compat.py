@@ -27,9 +27,10 @@ global is patched: no `os` function is replaced and no other file deletion
 anywhere in the process is affected.
 
 The cost of mirroring is drift. `UPSTREAM_SOURCE_SHA256` pins the upstream
-source this copy was written against, `verify_upstream_unchanged()` reports a
-mismatch, and a test fails loudly on a gltest upgrade so the copy is
-re-synced deliberately rather than silently diverging.
+source this copy was written against. On a mismatch `install()` RAISES rather
+than warning: continuing would run the suite against a mirrored injector that
+was never reconciled with the gltest actually installed, which is exactly the
+situation a warning scrolling past would hide.
 
 When the temp file is deleted
 -----------------------------
@@ -186,12 +187,15 @@ def install() -> bool:
     ):
         _ORIGINAL_INJECT = _loader._inject_message_to_fd0
 
+
+    # Fail fast: an unreconciled mirror must not be installed silently.
     if not verify_upstream_unchanged():
-        warnings.warn(
-            "gltest's _inject_message_to_fd0 differs from the source this "
-            "shim mirrors; re-sync windows_stdin_compat.py before trusting "
-            "Direct Mode on Windows",
-            RuntimeWarning,
+        raise RuntimeError(
+            "gltest's _inject_message_to_fd0 differs from the source "
+            "windows_stdin_compat.py mirrors. Re-sync the copy and update "
+            "UPSTREAM_SOURCE_SHA256 (installed gltest now hashes to "
+            + upstream_source_sha256()
+            + ")."
         )
 
     original_cleanup = VMContext._cleanup_after_deactivate
