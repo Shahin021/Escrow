@@ -827,6 +827,7 @@ class ProjectEscrow(gl.Contract):
     settlement_to_worker: u256
     settlement_to_client: u256
     settlement_nonce: u32
+    total_unmatched_swept: u256
     total_settled_worker: u256
     total_settled_client: u256
     total_appeal_bonds_received: u256
@@ -926,6 +927,7 @@ class ProjectEscrow(gl.Contract):
         self.settlement_to_worker = u256(0)
         self.settlement_to_client = u256(0)
         self.settlement_nonce = u32(0)
+        self.total_unmatched_swept = u256(0)
         self.total_settled_worker = u256(0)
         self.total_settled_client = u256(0)
         self.total_appeal_bonds_received = u256(0)
@@ -1840,7 +1842,15 @@ class ProjectEscrow(gl.Contract):
             # Nothing was attached, so nothing can be stranded by raising.
             raise gl.vm.UserError("no value attached")
 
-        if gl.message.sender_address == self.worker:
+        # Appeal credit only means something while the project can still be
+        # appealed. Once the project is settling or closed there is nothing
+        # left to bond, and crediting the worker here would let value arriving
+        # after settlement hold the project open indefinitely. Such value is
+        # treated as unattributable and leaves through sweep_unmatched().
+        if (
+            gl.message.sender_address == self.worker
+            and self.project_status == "ACTIVE"
+        ):
             self.appeal_credit_held = u256(
                 self.appeal_credit_held + value
             )
@@ -2305,7 +2315,7 @@ class ProjectEscrow(gl.Contract):
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
                 )
-        elif kind == "SETTLEMENT_CLIENT":
+        elif kind in ("SETTLEMENT_CLIENT", "UNMATCHED_SWEEP"):
             if gl.message.sender_address != self.client:
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
@@ -2514,6 +2524,21 @@ class ProjectEscrow(gl.Contract):
                 i += 1
 
             self.project_status = "SETTLING"
+
+        elif kind == "UNMATCHED_SWEEP":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Unattributable value returned to the client is not a principal
+            # refund, so total_refunded is untouched.
+            self.total_unmatched_swept = u256(
+                self.total_unmatched_swept + amount
+            )
 
         elif kind in ("SETTLEMENT_WORKER", "SETTLEMENT_CLIENT"):
             self.outflow_statuses[outflow_id] = "CONFIRMED"
@@ -2778,6 +2803,40 @@ class ProjectEscrow(gl.Contract):
         self.outflow_balance_before.append(u256(0))
 
     @gl.public.write
+    def sweep_unmatched(self) -> None:
+        """Return unattributable value to the client.
+
+        Value can reach this contract without a claim attached: a failed
+        emitted message refunding into __on_errored_message__, or someone
+        paying fund_appeal_credit when no appeal credit can exist. It cannot
+        be refused, because probe L9 showed that raising inside a payable
+        method keeps the value while rolling the accounting back.
+
+        Without an exit, such value would hold the project in SETTLING
+        forever, since close_project requires every bucket to be empty. The
+        policy is therefore: unattributable value goes to the client, the
+        party that funded the escrow, through the same serialized outflow
+        engine as everything else. Permissionless, because the recipient is
+        fixed and the amount comes from the ledger.
+        """
+        amount = int(self.unmatched_held)
+
+        if amount == 0:
+            raise gl.vm.UserError("there is no unmatched value")
+
+        self.unmatched_held = u256(0)
+        self.queued_out = u256(int(self.queued_out) + amount)
+
+        self.outflow_kinds.append("UNMATCHED_SWEEP")
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(self.client)
+        self.outflow_amounts.append(u256(amount))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
+
+    @gl.public.write
     def close_project(self) -> None:
         if self.project_status != "SETTLING":
             raise gl.vm.UserError(
@@ -2875,6 +2934,7 @@ class ProjectEscrow(gl.Contract):
             ),
             "appeal_bond_held": str(int(self.appeal_bond_held)),
             "appeal_credit_held": str(int(self.appeal_credit_held)),
+            "unmatched_swept": str(int(self.total_unmatched_swept)),
             "settled_worker": str(int(self.total_settled_worker)),
             "settled_client": str(int(self.total_settled_client)),
             "appeal_credit_received": str(
@@ -3044,6 +3104,10 @@ class ProjectEscrow(gl.Contract):
             "to_client": str(int(self.settlement_to_client)),
             "nonce": str(int(self.settlement_nonce)),
         }
+
+    @gl.public.view
+    def get_total_unmatched_swept(self) -> str:
+        return str(int(self.total_unmatched_swept))
 
     @gl.public.view
     def get_total_settled_worker(self) -> str:

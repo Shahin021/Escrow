@@ -665,3 +665,231 @@ def test_invalid_amount_strings_are_rejected(
 
     assert escrow.get_settlement()["active"] is False
     assert _identity(escrow)
+
+
+# ------------------------------------------- unexpected value and liveness
+
+
+def _pay_credit(direct_vm, escrow, sender, amount):
+    direct_vm.sender = sender
+    direct_vm.value = amount
+
+    try:
+        escrow.fund_appeal_credit()
+    finally:
+        direct_vm.value = 0
+
+    direct_vm.deal(
+        direct_vm._contract_address,
+        _resident(escrow) + int(escrow.get_inflight_out()),
+    )
+
+
+def test_unmatched_value_before_settlement_can_be_swept(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    # A third party pays in: unattributable, so it is held, not refused,
+    # because refusing inside a payable method would strand it (probe L9).
+    _pay_credit(direct_vm, escrow, direct_bob, 70)
+
+    assert escrow.get_accounting()["unmatched_held"] == "70"
+    assert _identity(escrow)
+
+    # Settlement must not be able to hand out that value.
+    direct_vm.sender = direct_owner
+    _expect_revert(
+        "settlement must allocate exactly the locked principal",
+        lambda: escrow.propose_settlement("500", "570"),
+    )
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    assert escrow.get_outflow_kind(0) == "UNMATCHED_SWEEP"
+    assert (
+        escrow.get_outflow_recipient(0).lower()
+        == ("0x" + direct_owner.hex()).lower()
+    )
+    assert escrow.get_accounting()["unmatched_held"] == "0"
+    assert _identity(escrow)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    assert escrow.get_total_unmatched_swept() == "70"
+    assert escrow.get_total_refunded() == "0"
+    assert _identity(escrow)
+
+
+def test_payment_after_settlement_cannot_block_closing(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    """The liveness hole this commit closes.
+
+    Value arriving after settlement used to land in unmatched_held, which
+    close_project requires to be empty and nothing could ever empty, so any
+    late payment pinned the project in SETTLING forever.
+    """
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 600, 400)
+    _accept(direct_vm, escrow, direct_alice)
+
+    for leg in (0, 1):
+        _complete_transfer(direct_vm, escrow)
+        escrow.confirm_outflow(leg)
+
+    # Late payments from either party and from a stranger.
+    _pay_credit(direct_vm, escrow, direct_bob, 30)
+    _pay_credit(direct_vm, escrow, direct_alice, 20)
+
+    acc = escrow.get_accounting()
+
+    # Even the worker's late payment is unattributable now: no appeal can
+    # exist, so crediting it would let the worker hold the project open.
+    assert acc["unmatched_held"] == "50"
+    assert acc["appeal_credit_held"] == "0"
+    assert escrow.get_project_status() == "SETTLING"
+    assert _identity(escrow)
+
+    _expect_revert(
+        "project still has unsettled obligations",
+        lambda: escrow.close_project(),
+    )
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(2)
+
+    assert escrow.get_total_unmatched_swept() == "50"
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert _identity(escrow)
+
+
+def test_repeated_late_payments_still_allow_closing(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 1000, 0)
+    _accept(direct_vm, escrow, direct_alice)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    # Each round of unattributable value has its own exit, and every sweep
+    # sends it to the client, so there is nothing to gain by repeating it.
+    outflow_id = 1
+
+    for amount in (11, 22):
+        _pay_credit(direct_vm, escrow, direct_bob, amount)
+
+        direct_vm.sender = direct_bob
+        escrow.sweep_unmatched()
+
+        _complete_transfer(direct_vm, escrow)
+        escrow.confirm_outflow(outflow_id)
+        outflow_id += 1
+
+        assert _identity(escrow)
+
+    assert escrow.get_total_unmatched_swept() == "33"
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert _identity(escrow)
+
+
+def test_sweep_requires_something_to_sweep(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _expect_revert(
+        "there is no unmatched value",
+        lambda: escrow.sweep_unmatched(),
+    )
+
+    assert int(escrow.get_outflow_count()) == 0
+    assert _identity(escrow)
+
+
+def test_bounced_sweep_is_redirectable_only_by_the_client(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _pay_credit(direct_vm, escrow, direct_bob, 40)
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    direct_vm.value = 40
+
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    assert escrow.get_outflow_status(0) == "BOUNCED"
+    assert _identity(escrow)
+
+    for sender in (direct_alice, direct_bob):
+        direct_vm.sender = sender
+        _expect_revert(
+            "only the client can redirect this outflow",
+            lambda: escrow.redirect_outflow(0, "0x" + sender.hex()),
+        )
+
+    direct_vm.sender = direct_owner
+    escrow.redirect_outflow(0, "0x" + direct_owner.hex())
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    assert escrow.get_total_unmatched_swept() == "40"
+    assert _identity(escrow)
+
+
+def test_worker_credit_still_works_while_the_project_is_active(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _pay_credit(direct_vm, escrow, direct_alice, 90)
+
+    # Unchanged behaviour before settlement: the worker's payment is credit,
+    # not unmatched value.
+    assert escrow.get_appeal_credit_held() == "90"
+    assert escrow.get_accounting()["unmatched_held"] == "0"
+    assert _identity(escrow)
