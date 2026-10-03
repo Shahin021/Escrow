@@ -2389,19 +2389,26 @@ class ProjectEscrow(gl.Contract):
             )
 
         amount = self.outflow_amounts[outflow_id]
-        before = self.outflow_balance_before[outflow_id]
 
-        if before < amount:
-            raise gl.vm.UserError(
-                "invalid outflow balance baseline"
-            )
+        # Expected balance is derived from the ledger, not from a snapshot
+        # taken when the outflow was emitted. A snapshot cannot survive value
+        # arriving in between: anyone could pay in after the emit and block
+        # the confirmation forever, stalling the serialized queue and with it
+        # the whole project. Every arrival is itself recorded in a bucket
+        # (unmatched_held for unattributable value), so the ledger stays the
+        # authority and the exact drop is still required.
+        #
+        # Only this one outflow can be in flight, so inflight_out == amount.
+        expected_after = u256(
+            int(self.locked)
+            + int(self.appeal_credit_held)
+            + int(self.appeal_bond_held)
+            + int(self.queued_out)
+            + int(self.bounced_held)
+            + int(self.unmatched_held)
+        )
 
-        expected_after = u256(before - amount)
-
-        # Confirm an exact native-balance drop of this outflow amount.
-        # Pre-existing unmatched surplus is tolerated because it is already
-        # included in `before`; unexplained extra loss is never accepted.
-        if self.balance == before:
+        if self.balance == u256(int(expected_after) + int(amount)):
             raise gl.vm.UserError(
                 "outflow has not completed yet"
             )
@@ -2812,12 +2819,15 @@ class ProjectEscrow(gl.Contract):
         be refused, because probe L9 showed that raising inside a payable
         method keeps the value while rolling the accounting back.
 
-        Without an exit, such value would hold the project in SETTLING
-        forever, since close_project requires every bucket to be empty. The
-        policy is therefore: unattributable value goes to the client, the
-        party that funded the escrow, through the same serialized outflow
-        engine as everything else. Permissionless, because the recipient is
-        fixed and the amount comes from the ledger.
+        The policy is: unattributable value goes to the client, the party
+        that funded the escrow, through the same serialized outflow engine as
+        everything else. Permissionless, because the recipient is fixed and
+        the amount comes from the ledger.
+
+        Callable in any project status, including after CLOSED, and it never
+        changes the status: closing does not discard this value, and value
+        arriving afterwards still has a way out. Closing itself does not
+        depend on this bucket, so paying in cannot block it.
         """
         amount = int(self.unmatched_held)
 
@@ -2848,13 +2858,19 @@ class ProjectEscrow(gl.Contract):
             or self.queued_out != u256(0)
             or self.inflight_out != u256(0)
             or self.bounced_held != u256(0)
-            or self.unmatched_held != u256(0)
             or self.appeal_bond_held != u256(0)
             or self.appeal_credit_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
             )
+
+        # unmatched_held is deliberately NOT a closing condition. Nobody can
+        # stop value arriving (refusing it inside a payable method strands it,
+        # per probe L9), so any closing rule that depends on that bucket being
+        # empty is controlled by whoever pays in last: sweep, pay again,
+        # blocked forever. It stays accounted for and sweepable after CLOSED
+        # instead, and closing never discards it.
 
         i = 0
 

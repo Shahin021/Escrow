@@ -762,11 +762,8 @@ def test_payment_after_settlement_cannot_block_closing(
     assert escrow.get_project_status() == "SETTLING"
     assert _identity(escrow)
 
-    _expect_revert(
-        "project still has unsettled obligations",
-        lambda: escrow.close_project(),
-    )
-
+    # Closing does not depend on this bucket, so a late payment cannot hold
+    # the project open; the value stays accounted for either way.
     direct_vm.sender = direct_bob
     escrow.sweep_unmatched()
 
@@ -892,4 +889,289 @@ def test_worker_credit_still_works_while_the_project_is_active(
     # not unmatched value.
     assert escrow.get_appeal_credit_held() == "90"
     assert escrow.get_accounting()["unmatched_held"] == "0"
+    assert _identity(escrow)
+
+
+def test_payment_between_sweep_and_close_cannot_block_closing(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    """The race this commit closes.
+
+    Sweeping alone was not enough: anyone could pay again between the sweep
+    and close_project, refilling the bucket that closing required to be
+    empty, forever.
+    """
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 600, 400)
+    _accept(direct_vm, escrow, direct_alice)
+
+    for leg in (0, 1):
+        _complete_transfer(direct_vm, escrow)
+        escrow.confirm_outflow(leg)
+
+    _pay_credit(direct_vm, escrow, direct_bob, 30)
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(2)
+
+    # A fresh payment lands after the sweep and before closing.
+    _pay_credit(direct_vm, escrow, direct_bob, 45)
+
+    assert escrow.get_accounting()["unmatched_held"] == "45"
+
+    # Closing no longer depends on that bucket.
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert escrow.get_accounting()["unmatched_held"] == "45"
+    assert _identity(escrow)
+
+    # And the value is still accounted for and still has a way out.
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(3)
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert escrow.get_total_unmatched_swept() == "75"
+    assert escrow.get_accounting()["unmatched_held"] == "0"
+    assert _identity(escrow)
+
+
+def test_payment_after_closed_is_accounted_and_sweepable(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 1000, 0)
+    _accept(direct_vm, escrow, direct_alice)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+
+    # Payments after closing, from a stranger and from each party.
+    for sender, amount in (
+        (direct_bob, 12),
+        (direct_alice, 13),
+        (direct_owner, 14),
+    ):
+        _pay_credit(direct_vm, escrow, sender, amount)
+
+    assert escrow.get_accounting()["unmatched_held"] == "39"
+    assert escrow.get_appeal_credit_held() == "0"
+    assert _identity(escrow)
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(1)
+
+    # Sweeping never reopens or re-closes the project.
+    assert escrow.get_project_status() == "CLOSED"
+    assert escrow.get_total_unmatched_swept() == "39"
+    # And it is not a principal refund or settled principal.
+    assert escrow.get_total_refunded() == "0"
+    assert escrow.get_total_settled_client() == "0"
+    assert escrow.get_total_settled_worker() == "1000"
+    assert _identity(escrow)
+
+
+def test_late_payments_while_a_sweep_is_queued_emitted_or_bounced(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 600, 400)
+    _accept(direct_vm, escrow, direct_alice)
+
+    # Pay while a settlement leg is still in flight.
+    _pay_credit(direct_vm, escrow, direct_bob, 10)
+
+    assert escrow.get_outflow_status(0) == "EMITTED"
+    assert escrow.get_outflow_status(1) == "QUEUED"
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    # The sweep queues behind the settlement legs: one in flight at a time.
+    assert escrow.get_outflow_status(2) == "QUEUED"
+    assert escrow.get_inflight_out() == "600"
+    assert _identity(escrow)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    # Pay again while the next leg is in flight.
+    _pay_credit(direct_vm, escrow, direct_bob, 20)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(1)
+
+    # The first sweep is now in flight; bounce it.
+    assert escrow.get_outflow_status(2) == "EMITTED"
+
+    direct_vm.value = 10
+
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    assert escrow.get_outflow_status(2) == "BOUNCED"
+    assert _identity(escrow)
+
+    # Pay again while a sweep is bounced.
+    _pay_credit(direct_vm, escrow, direct_bob, 30)
+
+    assert escrow.get_accounting()["unmatched_held"] == "50"
+    assert _identity(escrow)
+
+    # Only the client owns a bounced sweep.
+    for sender in (direct_alice, direct_bob):
+        direct_vm.sender = sender
+        _expect_revert(
+            "only the client can redirect this outflow",
+            lambda: escrow.redirect_outflow(2, "0x" + sender.hex()),
+        )
+
+    direct_vm.sender = direct_owner
+    escrow.redirect_outflow(2, "0x" + direct_owner.hex())
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(2)
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(3)
+
+    assert escrow.get_total_unmatched_swept() == "60"
+    assert escrow.get_accounting()["unmatched_held"] == "0"
+    assert _identity(escrow)
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+
+
+def test_closing_still_blocked_by_real_obligations(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    """Dropping unmatched from the closing rule must not loosen the rest."""
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 600, 400)
+    _accept(direct_vm, escrow, direct_alice)
+
+    # A settlement leg is still owed.
+    _expect_revert(
+        "project still has unsettled obligations",
+        lambda: escrow.close_project(),
+    )
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    _expect_revert(
+        "project still has unsettled obligations",
+        lambda: escrow.close_project(),
+    )
+
+    # Bounce the second leg: bounced value still blocks closing.
+    direct_vm.value = 400
+
+    try:
+        escrow.__on_errored_message__()
+    finally:
+        direct_vm.value = 0
+
+    assert escrow.get_accounting()["bounced_held"] == "400"
+
+    _expect_revert(
+        "project still has unsettled obligations",
+        lambda: escrow.close_project(),
+    )
+
+    direct_vm.sender = direct_owner
+    escrow.redirect_outflow(1, "0x" + direct_owner.hex())
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(1)
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert _identity(escrow)
+
+
+def test_repeated_sweep_without_balance_is_rejected_after_closing(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    escrow = _funded(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _propose(direct_vm, escrow, direct_owner, 1000, 0)
+    _accept(direct_vm, escrow, direct_alice)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    escrow.close_project()
+
+    _pay_credit(direct_vm, escrow, direct_bob, 25)
+
+    direct_vm.sender = direct_bob
+    escrow.sweep_unmatched()
+
+    outflows = int(escrow.get_outflow_count())
+
+    # No second claim on the same value.
+    _expect_revert(
+        "there is no unmatched value",
+        lambda: escrow.sweep_unmatched(),
+    )
+
+    assert int(escrow.get_outflow_count()) == outflows
+    assert _identity(escrow)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(1)
+
+    _expect_revert(
+        "outflow is not emitted",
+        lambda: escrow.confirm_outflow(1),
+    )
+
+    assert escrow.get_total_unmatched_swept() == "25"
+    assert escrow.get_project_status() == "CLOSED"
     assert _identity(escrow)
