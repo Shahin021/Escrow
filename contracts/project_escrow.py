@@ -2072,6 +2072,81 @@ class ProjectEscrow(gl.Contract):
         self._abort_open_appeal(milestone_index)
 
     @gl.public.write
+    def finalize_rejection(self, milestone_index: int) -> None:
+        """Close out a final rejection once the worker's options are spent.
+
+        A finally rejected milestone must not sit forever. This is the
+        client-side exit, and it is permissionless for the same reason as the
+        other timeouts: every input is contract state plus the transaction
+        datetime, and the value can only follow the refund path to the
+        client, so no caller can influence the outcome.
+
+        Timing:
+          appeal never used   -> only once the appeal window has passed, so
+                                 the worker's right to appeal is preserved
+          appeal resolved     -> immediately; the one allowed appeal is spent
+          appeal still open   -> only if it has failed for infrastructure
+                                 reasons AND its window has passed, in which
+                                 case the bond goes back to the worker first
+        """
+        self._require_active_milestone(milestone_index)
+
+        status = self.milestone_statuses[milestone_index]
+        appeal_used = self.milestone_appeal_used[milestone_index] != u32(0)
+        appeal_open = self.milestone_appeal_open[milestone_index] != u32(0)
+
+        # While an appeal is open the milestone carries the review status of
+        # that appeal, not REJECTED_FINAL, so both shapes are accepted here.
+        if appeal_open:
+            if status not in (
+                "UNDER_APPEAL",
+                "REVIEW_STALLED",
+                "EVIDENCE_UNAVAILABLE",
+            ):
+                raise gl.vm.UserError(
+                    "appeal is in an unexpected state"
+                )
+        elif status != "REJECTED_FINAL":
+            raise gl.vm.UserError(
+                "milestone is not finally rejected"
+            )
+
+        expiry = self._appeal_expiry(milestone_index)
+
+        if expiry == 0:
+            raise gl.vm.UserError(
+                "milestone has no final rejection time"
+            )
+
+        if appeal_open:
+            # The worker may still be waiting for consensus or for the
+            # evidence host, so only an appeal that has demonstrably failed
+            # can be cleared here, and only after the window has passed.
+            if self._appeal_failure_reason(milestone_index) == "":
+                raise gl.vm.UserError(
+                    "appeal is still in progress"
+                )
+
+            if self._now() < expiry:
+                raise gl.vm.UserError(
+                    "appeal window has not passed"
+                )
+
+            # Consensus stalling or an unreachable artifact is not the
+            # worker's fault, so the bond returns rather than being
+            # forfeited. This also re-sets the milestone to REJECTED_FINAL.
+            self._abort_open_appeal(milestone_index)
+        elif not appeal_used:
+            # Boundary rule: a window action is allowed while now < expiry,
+            # so finalizing is allowed from the expiry instant onwards.
+            if self._now() < expiry:
+                raise gl.vm.UserError(
+                    "appeal window has not passed"
+                )
+
+        self._queue_refund_for_failed_milestone(milestone_index)
+
+    @gl.public.write
     def expire_delivery(self, milestone_index: int) -> None:
         """Deterministic delivery timeout.
 
