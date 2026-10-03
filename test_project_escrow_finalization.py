@@ -560,3 +560,125 @@ def test_bond_return_and_refund_are_serialized_after_a_stalled_appeal(
     assert escrow.get_total_refunded() == str(TOTAL)
     assert escrow.get_project_status() == "SETTLING"
     assert _identity(escrow)
+
+
+def test_finalization_of_an_unavailable_appeal_waits_for_the_grace(
+    direct_vm,
+    direct_deploy,
+    direct_owner,
+    direct_alice,
+    direct_bob,
+):
+    """The EVIDENCE_UNAVAILABLE arm of finalize_rejection, end to end.
+
+    The appeal artifact becomes unreachable, so the appeal can neither be
+    judged nor stall. Finalization must still wait for the full grace window,
+    and must then return the bond rather than forfeit it, because an
+    unreachable host is not the worker's fault.
+    """
+    escrow = _rejected(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _credit(direct_vm, escrow, direct_alice, BOND)
+
+    direct_vm.sender = direct_alice
+    escrow.appeal(0, "")
+
+    # The appeal review fetches the artifact and it is gone. Placed so the
+    # grace window outlasts the appeal window, which is what makes this arm
+    # distinguishable from the stalled one.
+    unavailable_at = T0_EPOCH + 2 * DAY
+    set_chain_time(at(unavailable_at))
+    _mock(direct_vm, status=404, body="")
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert escrow.get_milestone_appeal_open(0) is True
+    assert escrow.get_milestone_unavailable_since(0) == str(unavailable_at)
+    assert escrow.get_milestone_appeal_failure_threshold(0) == str(
+        unavailable_at + GRACE
+    )
+    assert escrow.get_appeal_bond_held() == str(BOND)
+    assert _identity(escrow)
+
+    # The appeal window has passed, but the grace has not: the worker may
+    # still get a verdict if the host comes back.
+    set_chain_time(at(T0_EPOCH + APPEAL_WINDOW + HOUR))
+
+    _expect_revert(
+        "appeal is still in progress",
+        lambda: escrow.finalize_rejection(0),
+    )
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert escrow.get_appeal_bond_held() == str(BOND)
+    assert escrow.get_locked() == str(TOTAL)
+    assert int(escrow.get_outflow_count()) == 0
+    assert _identity(escrow)
+
+    # A retry while still unavailable must not push the threshold out.
+    set_chain_time(at(unavailable_at + GRACE - HOUR))
+    _mock(direct_vm, status=404, body="")
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_unavailable_since(0) == str(unavailable_at)
+
+    _expect_revert(
+        "appeal is still in progress",
+        lambda: escrow.finalize_rejection(0),
+    )
+
+    assert _identity(escrow)
+
+    # Exactly at the grace boundary, with the appeal window already passed.
+    set_chain_time(at(unavailable_at + GRACE))
+
+    direct_vm.sender = direct_bob
+    escrow.finalize_rejection(0)
+
+    # No substantive verdict was reached, so no criteria bits are invented
+    # and the bond goes back to the worker.
+    assert escrow.get_milestone_status(0) == "REFUND_PENDING"
+    assert escrow.get_milestone_appeal_open(0) is False
+    assert escrow.get_milestone_appeal_used(0) is True
+    assert escrow.get_milestone_unavailable_since(0) == "0"
+    assert escrow.get_appeal_bond_held() == "0"
+    assert escrow.get_total_bonds_forfeited() == "0"
+
+    assert escrow.get_outflow_kind(0) == "APPEAL_BOND_RETURN"
+    assert (
+        escrow.get_outflow_recipient(0).lower()
+        == ("0x" + direct_alice.hex()).lower()
+    )
+    assert escrow.get_outflow_kind(1) == "PROJECT_REMAINDER_REFUND"
+    assert (
+        escrow.get_outflow_recipient(1).lower()
+        == ("0x" + direct_owner.hex()).lower()
+    )
+
+    # Serialized: the refund waits for the bond return to complete.
+    assert escrow.get_outflow_status(0) == "EMITTED"
+    assert escrow.get_outflow_status(1) == "QUEUED"
+    assert escrow.get_inflight_out() == str(BOND)
+    assert escrow.get_queued_out() == str(TOTAL)
+    assert _identity(escrow)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(0)
+
+    assert escrow.get_total_bonds_returned() == str(BOND)
+    assert escrow.get_outflow_status(1) == "EMITTED"
+    assert _identity(escrow)
+
+    _complete_transfer(direct_vm, escrow)
+    escrow.confirm_outflow(1)
+
+    assert escrow.get_milestone_status(0) == "REFUNDED"
+    assert escrow.get_milestone_status(1) == "CANCELLED"
+    assert escrow.get_total_refunded() == str(TOTAL)
+    assert escrow.get_project_status() == "SETTLING"
+    assert _identity(escrow)
+
+    escrow.close_project()
+
+    assert escrow.get_project_status() == "CLOSED"
+    assert _identity(escrow)

@@ -40,10 +40,19 @@ py -3.12 -m venv .venv
 
 ## Verified results
 
-| Platform | Suite | Shim tests | Date |
-| --- | --- | --- | --- |
-| Windows | 356 / 356 passed | 9 / 9 passed | 2026-10-01 |
-| Linux (authoritative, CI) | 356 / 356 passed | 9 / 9 passed | 2026-10-01 |
+Each row names the commit it was run against. A result is not carried
+forward to later commits.
+
+| Platform | Commit | Suite | Shim tests | Date |
+| --- | --- | --- | --- | --- |
+| Windows | `2f107c6` | 356 / 356 passed | 9 / 9 passed | 2026-10-03 |
+| Linux | `2f107c6` | 356 / 356 passed | 9 / 9 passed | 2026-10-03 |
+| Linux | `62a115d` + finalization tests | 369 / 369 passed | 9 / 9 passed | 2026-10-03 |
+
+**Not yet verified on Windows:** the current branch. The Windows run covers
+`2f107c6`, which is the commit that fixed the shim tests. `finalize_rejection`
+and its 13 tests landed afterwards, so the 369-test suite has only been run
+on Linux. Windows coverage of the current tree is outstanding.
 
 ## Windows support
 
