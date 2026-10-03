@@ -820,6 +820,15 @@ class ProjectEscrow(gl.Contract):
     appeal_credit_held: u256
     total_appeal_credit_received: u256
     total_appeal_credit_refunded: u256
+    # Mutual settlement: one active proposal at a time, replay-protected by a
+    # nonce that moves on every proposal, withdrawal or acceptance.
+    settlement_active: bool
+    settlement_proposer: Address
+    settlement_to_worker: u256
+    settlement_to_client: u256
+    settlement_nonce: u32
+    total_settled_worker: u256
+    total_settled_client: u256
     total_appeal_bonds_received: u256
     appeal_bond_held: u256
     total_bonds_returned: u256
@@ -912,6 +921,13 @@ class ProjectEscrow(gl.Contract):
         self.appeal_credit_held = u256(0)
         self.total_appeal_credit_received = u256(0)
         self.total_appeal_credit_refunded = u256(0)
+        self.settlement_active = False
+        self.settlement_proposer = Address(bytes(20))
+        self.settlement_to_worker = u256(0)
+        self.settlement_to_client = u256(0)
+        self.settlement_nonce = u32(0)
+        self.total_settled_worker = u256(0)
+        self.total_settled_client = u256(0)
         self.total_appeal_bonds_received = u256(0)
         self.appeal_bond_held = u256(0)
         self.total_bonds_returned = u256(0)
@@ -2289,7 +2305,16 @@ class ProjectEscrow(gl.Contract):
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
                 )
-        elif kind in ("APPEAL_BOND_RETURN", "APPEAL_CREDIT_REFUND"):
+        elif kind == "SETTLEMENT_CLIENT":
+            if gl.message.sender_address != self.client:
+                raise gl.vm.UserError(
+                    "only the client can redirect this outflow"
+                )
+        elif kind in (
+            "APPEAL_BOND_RETURN",
+            "APPEAL_CREDIT_REFUND",
+            "SETTLEMENT_WORKER",
+        ):
             if gl.message.sender_address != self.worker:
                 raise gl.vm.UserError(
                     "only the worker can redirect this outflow"
@@ -2490,6 +2515,27 @@ class ProjectEscrow(gl.Contract):
 
             self.project_status = "SETTLING"
 
+        elif kind in ("SETTLEMENT_WORKER", "SETTLEMENT_CLIENT"):
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+
+            # Settlement is its own outcome: it is neither a milestone payout
+            # nor a principal refund, so those totals are untouched.
+            if kind == "SETTLEMENT_WORKER":
+                self.total_settled_worker = u256(
+                    self.total_settled_worker + amount
+                )
+            else:
+                self.total_settled_client = u256(
+                    self.total_settled_client + amount
+                )
+
         elif kind == "APPEAL_CREDIT_REFUND":
             self.outflow_statuses[outflow_id] = "CONFIRMED"
 
@@ -2543,6 +2589,193 @@ class ProjectEscrow(gl.Contract):
         # Future phases may queue multiple serialized outflows.
         # If one already exists, emit it after confirming this one.
         self._emit_one_queued_outflow()
+
+    def _require_settlement_party(self):
+        sender = gl.message.sender_address
+
+        if sender != self.client and sender != self.worker:
+            raise gl.vm.UserError(
+                "only the client or the worker can settle"
+            )
+
+        return sender
+
+    def _require_ledger_idle(self):
+        """Idle means idle in the internal ledger, never in native balance.
+
+        Any outflow still queued, in flight or bounced is already owed to a
+        named recipient, and an open appeal or held bond means bond ownership
+        is unresolved. Settling over either would double-spend.
+        """
+        if (
+            self.queued_out != u256(0)
+            or self.inflight_out != u256(0)
+            or self.bounced_held != u256(0)
+        ):
+            raise gl.vm.UserError(
+                "settlement requires an idle outflow ledger"
+            )
+
+        if self.appeal_bond_held != u256(0):
+            raise gl.vm.UserError(
+                "settlement requires the appeal bond to be resolved"
+            )
+
+        index = 0
+
+        while index < len(self.milestone_statuses):
+            status = self.milestone_statuses[index]
+
+            if status in (
+                "APPROVED",
+                "PAYMENT_PENDING",
+                "REFUND_PENDING",
+            ):
+                raise gl.vm.UserError(
+                    "a milestone is already owed payment or refund"
+                )
+
+            if self.milestone_appeal_open[index] != u32(0):
+                raise gl.vm.UserError(
+                    "settlement requires no open appeal"
+                )
+
+            index += 1
+
+    @gl.public.write
+    def propose_settlement(
+        self,
+        to_worker: str,
+        to_client: str,
+    ) -> None:
+        """Offer a split of the settleable principal.
+
+        The pot is exactly `locked`: unmatched value, appeal credit, appeal
+        bonds and anything already queued, in flight or bounced are excluded,
+        because none of them is unallocated escrow principal.
+        """
+        if self.project_status != "ACTIVE":
+            raise gl.vm.UserError("project is not active")
+
+        proposer = self._require_settlement_party()
+
+        self._require_ledger_idle()
+
+        worker_amount = _parse_amount(to_worker)
+        client_amount = _parse_amount(to_client)
+        pot = int(self.locked)
+
+        if pot == 0:
+            raise gl.vm.UserError("there is no principal to settle")
+
+        if worker_amount + client_amount != pot:
+            raise gl.vm.UserError(
+                "settlement must allocate exactly the locked principal"
+            )
+
+        # A new proposal always moves the nonce, so an earlier one can never
+        # be accepted afterwards.
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.settlement_active = True
+        self.settlement_proposer = proposer
+        self.settlement_to_worker = u256(worker_amount)
+        self.settlement_to_client = u256(client_amount)
+
+    @gl.public.write
+    def withdraw_settlement(self) -> None:
+        """Only the proposer may retract, and the nonce moves again."""
+        if not self.settlement_active:
+            raise gl.vm.UserError("no active settlement proposal")
+
+        if gl.message.sender_address != self.settlement_proposer:
+            raise gl.vm.UserError(
+                "only the proposer can withdraw the proposal"
+            )
+
+        self.settlement_active = False
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.settlement_to_worker = u256(0)
+        self.settlement_to_client = u256(0)
+
+    @gl.public.write
+    def accept_settlement(self, nonce: int) -> None:
+        """Accept the active proposal as the counterparty.
+
+        Acceptance quotes the nonce, so a proposal that was replaced or
+        withdrawn between reading and signing cannot be accepted by mistake.
+        """
+        if self.project_status != "ACTIVE":
+            raise gl.vm.UserError("project is not active")
+
+        if not self.settlement_active:
+            raise gl.vm.UserError("no active settlement proposal")
+
+        accepter = self._require_settlement_party()
+
+        if accepter == self.settlement_proposer:
+            raise gl.vm.UserError(
+                "the proposer cannot accept its own proposal"
+            )
+
+        if not _is_json_int(nonce) or nonce != int(self.settlement_nonce):
+            raise gl.vm.UserError("settlement proposal is stale")
+
+        self._require_ledger_idle()
+
+        worker_amount = int(self.settlement_to_worker)
+        client_amount = int(self.settlement_to_client)
+
+        # The pot may not have moved since the proposal was made.
+        if worker_amount + client_amount != int(self.locked):
+            raise gl.vm.UserError(
+                "settlement no longer matches the locked principal"
+            )
+
+        self.locked = u256(0)
+
+        index = 0
+
+        while index < len(self.milestone_statuses):
+            if self.milestone_statuses[index] not in (
+                "RELEASED",
+                "REFUNDED",
+                "CANCELLED",
+            ):
+                self.milestone_statuses[index] = "CANCELLED"
+
+            index += 1
+
+        # A zero side queues nothing: a zero-value transfer is never emitted.
+        # The agreed split stays visible in storage and the views.
+        if worker_amount > 0:
+            self._queue_settlement_leg(
+                "SETTLEMENT_WORKER",
+                self.worker,
+                worker_amount,
+            )
+
+        if client_amount > 0:
+            self._queue_settlement_leg(
+                "SETTLEMENT_CLIENT",
+                self.client,
+                client_amount,
+            )
+
+        self.settlement_active = False
+        self.settlement_nonce = u32(int(self.settlement_nonce) + 1)
+        self.project_status = "SETTLING"
+
+        self._emit_one_queued_outflow()
+
+    def _queue_settlement_leg(self, kind, recipient, amount):
+        self.queued_out = u256(int(self.queued_out) + amount)
+
+        self.outflow_kinds.append(kind)
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(recipient)
+        self.outflow_amounts.append(u256(amount))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
 
     @gl.public.write
     def close_project(self) -> None:
@@ -2642,6 +2875,8 @@ class ProjectEscrow(gl.Contract):
             ),
             "appeal_bond_held": str(int(self.appeal_bond_held)),
             "appeal_credit_held": str(int(self.appeal_credit_held)),
+            "settled_worker": str(int(self.total_settled_worker)),
+            "settled_client": str(int(self.total_settled_client)),
             "appeal_credit_received": str(
                 int(self.total_appeal_credit_received)
             ),
@@ -2798,6 +3033,25 @@ class ProjectEscrow(gl.Contract):
         if index < 0 or index >= len(self.milestone_delivery_windows):
             raise gl.vm.UserError("milestone index out of range")
         return str(self._delivery_deadline(index))
+
+    @gl.public.view
+    def get_settlement(self) -> dict:
+        """The active proposal, or its cleared form."""
+        return {
+            "active": self.settlement_active,
+            "proposer": self.settlement_proposer.as_hex,
+            "to_worker": str(int(self.settlement_to_worker)),
+            "to_client": str(int(self.settlement_to_client)),
+            "nonce": str(int(self.settlement_nonce)),
+        }
+
+    @gl.public.view
+    def get_total_settled_worker(self) -> str:
+        return str(int(self.total_settled_worker))
+
+    @gl.public.view
+    def get_total_settled_client(self) -> str:
+        return str(int(self.total_settled_client))
 
     @gl.public.view
     def get_appeal_credit_held(self) -> str:
