@@ -14,10 +14,6 @@ import os
 import windows_stdin_compat as compat
 
 
-class _FakeVM:
-    pass
-
-
 def test_shim_is_inactive_on_linux_by_default(monkeypatch):
     monkeypatch.delenv("ESCROW_FORCE_WINDOWS_STDIN_COMPAT", raising=False)
     monkeypatch.setattr(os, "name", "posix")
@@ -48,8 +44,18 @@ def _install_forced(monkeypatch):
     assert compat.is_active()
 
 
-def _fake_vm():
-    vm = _FakeVM()
+def _vm_for_injection():
+    """A real VMContext, because it must also be the cleanup target.
+
+    _write_encoded_to_fd0 stores the saved stdin descriptor on the object it
+    is given, and gltest restores fd 0 from that same attribute. Injecting
+    into one object and cleaning up a different one leaves fd 0 pointing at
+    the temp file, so on Windows the file stays open and undeletable, while
+    POSIX hides the mistake by allowing an open file to be unlinked.
+    """
+    from gltest.direct.vm import VMContext
+
+    vm = VMContext()
     vm.sender = b"\x11" * 20
     vm._contract_address = b"\x22" * 20
     vm.origin = b"\x33" * 20
@@ -58,6 +64,13 @@ def _fake_vm():
     vm._chain_id = 4221
 
     return vm
+
+
+def _fd0_identity():
+    """Identify whatever fd 0 currently refers to, portably."""
+    info = os.fstat(0)
+
+    return (info.st_dev, info.st_ino)
 
 
 def test_shim_does_not_replace_any_global_os_function(monkeypatch):
@@ -97,13 +110,17 @@ def test_deferred_delete_happens_after_stdin_restore(monkeypatch):
     _install_forced(monkeypatch)
 
     before = compat.pending_count()
+    original_fd0 = _fd0_identity()
     saved_stdin = os.dup(0)
+    vm = _vm_for_injection()
 
     try:
-        # The fd-0 half, which needs no active VM context.
-        compat._write_encoded_to_fd0(_fake_vm(), b"encoded-message")
+        compat._write_encoded_to_fd0(vm, b"encoded-message")
 
         assert compat.pending_count() == before + 1
+        assert _fd0_identity() != original_fd0, (
+            "injection must put the temp file on fd 0"
+        )
 
         path = compat._PENDING[-1]
 
@@ -111,10 +128,12 @@ def test_deferred_delete_happens_after_stdin_restore(monkeypatch):
             "the temp file must survive while fd 0 still holds it"
         )
 
-        vm = VMContext.__new__(VMContext)
-        vm._original_stdin_fd = None
+        # Same object: gltest restores fd 0 from the descriptor stored on it.
         VMContext._cleanup_after_deactivate(vm)
 
+        assert _fd0_identity() == original_fd0, (
+            "cleanup must restore fd 0 to the original stdin"
+        )
         assert not os.path.exists(path), (
             "the temp file must be deleted once stdin is restored"
         )
@@ -177,10 +196,12 @@ def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
     thread = threading.Thread(target=deleter)
     thread.start()
 
+    original_fd0 = _fd0_identity()
     saved_stdin = os.dup(0)
+    vm = _vm_for_injection()
 
     try:
-        compat._write_encoded_to_fd0(_fake_vm(), b"encoded-message")
+        compat._write_encoded_to_fd0(vm, b"encoded-message")
 
         thread.join(timeout=5)
 
@@ -197,10 +218,11 @@ def test_unrelated_thread_deletions_are_not_deferred(monkeypatch):
 
         assert os.path.exists(stdin_temp)
 
-        vm = VMContext.__new__(VMContext)
-        vm._original_stdin_fd = None
         VMContext._cleanup_after_deactivate(vm)
 
+        assert _fd0_identity() == original_fd0, (
+            "cleanup must restore fd 0 to the original stdin"
+        )
         assert not os.path.exists(stdin_temp)
     finally:
         os.dup2(saved_stdin, 0)
