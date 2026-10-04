@@ -119,6 +119,9 @@ def _leader_result(escrow, **overrides):
         "reason": escrow.get_attempt_reason(0),
         "criteria_bits": "111",
         "rubric_hash": escrow.get_milestone_rubric_hash(0),
+        # Phase 4 added the GitHub check gate; milestones without a
+        # required_check carry an empty hash.
+        "check_hash": "",
         "evidence_hash": escrow.get_attempt_evidence_hash(0),
         "excerpt": escrow.get_attempt_excerpt(0),
     }

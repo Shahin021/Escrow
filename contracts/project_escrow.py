@@ -92,6 +92,17 @@ EVIDENCE_UNAVAILABLE_GRACE_SECONDS = 48 * 3600
 MIN_DELIVERY_WINDOW_SECONDS = 1
 MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
 
+# Stable identifier for the read interface other contracts and tools code
+# against. Any change to the shape of the interface views below requires a new
+# id, never a silent redefinition of this one.
+ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v1"
+
+# Optional GitHub check gate. The check is always resolved against the exact
+# commit the evidence is pinned to, never against a branch or a later commit.
+GITHUB_API_HOST = "api.github.com"
+MAX_CHECK_NAME_CHARS = 100
+MAX_CHECK_RUNS = 50
+
 _HTTPS = "https://"
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
 
@@ -377,6 +388,155 @@ def _normalize_evidence(raw):
             lines.append(collapsed)
 
     return "\n".join(lines)[:MAX_EVIDENCE_CHARS]
+
+
+def _pinned_commit_parts(canonical):
+    """(owner, repo, commit) from an already validated pinned URL."""
+    parts = canonical[len(_HTTPS):].split("/")
+
+    return parts[1], parts[2], parts[3].lower()
+
+
+def _check_name_is_valid(name):
+    if len(name) == 0 or len(name) > MAX_CHECK_NAME_CHARS:
+        return False
+
+    for ch in name:
+        if not (
+            ("a" <= ch <= "z")
+            or ("A" <= ch <= "Z")
+            or ("0" <= ch <= "9")
+            or ch in " ._-"
+        ):
+            return False
+
+    return True
+
+
+def _summarize_check_runs(payload, wanted_name, commit):
+    """Select the authoritative check run for one commit, rerun-safe.
+
+    GitHub keeps every attempt of a check, so a commit that failed and was
+    then rerun successfully still lists the old failing run. Treating each
+    run as independently authoritative would let that stale failure reject
+    work that now passes, and a rejection costs the worker a revision.
+
+    Policy, all deterministic:
+
+      * the response must be complete: total_count must equal the number of
+        runs returned, otherwise it is paginated or truncated and no safe
+        answer exists
+      * only runs whose name matches exactly AND whose head_sha equals the
+        pinned commit are considered; a run without a head_sha cannot be
+        bound to the commit and is ignored
+      * if those runs come from more than one app, the name is ambiguous and
+        no safe answer exists
+      * otherwise the run with the greatest id wins, because GitHub ids
+        increase with each attempt, so the newest attempt decides
+
+    Returns (state, canonical) where state is PASSED, FAILED or UNRESOLVED.
+    UNRESOLVED is always safe: it never approves and never burns a revision.
+    """
+    if not isinstance(payload, dict):
+        raise gl.vm.UserError("check response is not a JSON object")
+
+    runs = payload.get("check_runs")
+
+    if not isinstance(runs, list):
+        raise gl.vm.UserError("check response has no check_runs array")
+
+    if len(runs) > MAX_CHECK_RUNS:
+        raise gl.vm.UserError("check response lists too many runs")
+
+    total = payload.get("total_count")
+
+    if not _is_json_int(total) or total < 0:
+        raise gl.vm.UserError("check response has no total_count")
+
+    if total != len(runs):
+        # Paginated or truncated: the decisive run may not even be here.
+        return "UNRESOLVED", "truncated:" + str(total) + ":" + str(len(runs))
+
+    selected_id = -1
+    selected = None
+    apps = []
+
+    for run in runs:
+        if not isinstance(run, dict):
+            raise gl.vm.UserError("check run is not a JSON object")
+
+        name = run.get("name")
+
+        if not isinstance(name, str) or name != wanted_name:
+            continue
+
+        head_sha = run.get("head_sha")
+
+        if not isinstance(head_sha, str) or head_sha.lower() != commit:
+            # Not bound to the commit under review, so it says nothing
+            # about this evidence.
+            continue
+
+        run_id = run.get("id")
+
+        if not _is_json_int(run_id) or run_id < 0:
+            raise gl.vm.UserError("check run has no id")
+
+        status = run.get("status")
+
+        if not isinstance(status, str):
+            raise gl.vm.UserError("check run has no status")
+
+        conclusion = run.get("conclusion")
+
+        if conclusion is None:
+            conclusion = ""
+
+        if not isinstance(conclusion, str):
+            raise gl.vm.UserError("check run conclusion is not a string")
+
+        app = run.get("app")
+        app_id = ""
+
+        if isinstance(app, dict) and _is_json_int(app.get("id")):
+            app_id = str(app.get("id"))
+
+        if app_id not in apps:
+            apps.append(app_id)
+
+        if run_id > selected_id:
+            selected_id = run_id
+            selected = (run_id, status, conclusion)
+
+    if selected is None:
+        return "UNRESOLVED", "none"
+
+    if len(apps) > 1:
+        apps.sort()
+        return "UNRESOLVED", "ambiguous:" + ",".join(apps)
+
+    run_id, status, conclusion = selected
+
+    # The selected run's identity and the commit are part of what validators
+    # must agree on, not just the verdict.
+    canonical = (
+        "run:"
+        + str(run_id)
+        + ":"
+        + commit
+        + ":"
+        + status
+        + ":"
+        + conclusion
+    )
+
+    if status != "completed":
+        return "UNRESOLVED", canonical
+
+    if conclusion != "success":
+        return "FAILED", canonical
+
+    return "PASSED", canonical
 
 
 def _check_pinned_url(url, allowed_raw):
@@ -736,6 +896,8 @@ class ProjectEscrow(gl.Contract):
     render_mode: str
     max_revisions: u32
     continue_after_refund: bool
+    # Optional outcome registry. Zero address means no reporting.
+    registry: Address
 
     project_status: str
 
@@ -774,6 +936,8 @@ class ProjectEscrow(gl.Contract):
     # Phase 3 timing. Both are epoch seconds derived from the transaction
     # datetime; 0 means "not configured" / "not activated yet". A window is
     # relative so a locked future milestone cannot age before it is active.
+    # Optional GitHub check name per milestone; "" means no gate.
+    milestone_required_checks: DynArray[str]
     milestone_delivery_windows: DynArray[u256]
     milestone_activated_at: DynArray[u256]
     # Start of the current review attempt; 0 when not under review.
@@ -846,6 +1010,7 @@ class ProjectEscrow(gl.Contract):
         render_mode: str = "text",
         max_revisions: int = 3,
         continue_after_refund: bool = False,
+        registry: str = "",
     ):
         if len(milestones_json) == 0:
             raise gl.vm.UserError("milestones are required")
@@ -904,6 +1069,11 @@ class ProjectEscrow(gl.Contract):
         self.render_mode = render_mode
         self.max_revisions = u32(max_revisions)
         self.continue_after_refund = continue_after_refund
+
+        if len(registry.strip()) == 0:
+            self.registry = Address(bytes(20))
+        else:
+            self.registry = Address(registry)
 
         self.project_status = "AWAITING_DEPOSIT"
 
@@ -1013,6 +1183,31 @@ class ProjectEscrow(gl.Contract):
                 > MAX_CRITERIA_TOTAL
             ):
                 raise gl.vm.UserError("too many criteria in project")
+
+            if "required_check" not in raw:
+                required_check = ""
+            else:
+                required_check = raw["required_check"]
+
+                if not isinstance(required_check, str):
+                    raise gl.vm.UserError(
+                        "required_check must be a string"
+                    )
+
+                required_check = required_check.strip()
+
+                if not _check_name_is_valid(required_check):
+                    raise gl.vm.UserError(
+                        "required_check is not a valid check name"
+                    )
+
+                if GITHUB_API_HOST not in sources:
+                    raise gl.vm.UserError(
+                        "required_check needs api.github.com in "
+                        "allowed_sources"
+                    )
+
+            self.milestone_required_checks.append(required_check)
 
             if "delivery_window_seconds" not in raw:
                 delivery_window = 0
@@ -1448,6 +1643,26 @@ class ProjectEscrow(gl.Contract):
             spec_copy,
         )
 
+        required_check_copy = self.milestone_required_checks[milestone_index]
+        check_api_url = ""
+
+        if required_check_copy:
+            # The check is resolved against the exact commit the evidence is
+            # pinned to, so a green run on a different commit can never stand
+            # in for this one.
+            owner, repo, commit = _pinned_commit_parts(url_copy)
+            check_api_url = (
+                _HTTPS
+                + GITHUB_API_HOST
+                + "/repos/"
+                + owner
+                + "/"
+                + repo
+                + "/commits/"
+                + commit
+                + "/check-runs"
+            )
+
         def leader_fn():
             try:
                 response = gl.nondet.web.get(url_copy)
@@ -1457,6 +1672,7 @@ class ProjectEscrow(gl.Contract):
                     "approved": False,
                     "reason": "artifact fetch failed",
                     "criteria_bits": "",
+                    "check_hash": "",
                     "rubric_hash": rubric_hash_copy,
                     "evidence_hash": "",
                     "excerpt": "",
@@ -1471,6 +1687,7 @@ class ProjectEscrow(gl.Contract):
                         + str(response.status)
                     ),
                     "criteria_bits": "",
+                    "check_hash": "",
                     "rubric_hash": rubric_hash_copy,
                     "evidence_hash": "",
                     "excerpt": "",
@@ -1485,6 +1702,8 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "check_hash": "",
+                    "check_hash": "",
                         "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
@@ -1498,6 +1717,8 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "check_hash": "",
+                    "check_hash": "",
                         "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
@@ -1513,6 +1734,8 @@ class ProjectEscrow(gl.Contract):
                         "approved": False,
                         "reason": "artifact exceeds evidence size limit",
                         "criteria_bits": "",
+                        "check_hash": "",
+                    "check_hash": "",
                         "rubric_hash": rubric_hash_copy,
                         "evidence_hash": "",
                         "excerpt": "",
@@ -1536,10 +1759,109 @@ class ProjectEscrow(gl.Contract):
                         "insufficient evidence"
                     ),
                     "criteria_bits": "",
+                    "check_hash": "",
                     "rubric_hash": rubric_hash_copy,
                     "evidence_hash": evidence_hash,
                     "excerpt": excerpt,
                 }
+
+            check_hash = ""
+
+            if check_api_url:
+                # Objective gate, before any model call. A missing, pending
+                # or rate-limited answer is UNAVAILABLE, so it never burns a
+                # revision; only a completed failing run is a rejection.
+                try:
+                    check_response = gl.nondet.web.get(check_api_url)
+                except Exception:
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": "required check could not be fetched",
+                        "criteria_bits": "",
+                        "check_hash": "",
+                        "rubric_hash": rubric_hash_copy,
+                        "evidence_hash": evidence_hash,
+                        "excerpt": excerpt,
+                    }
+
+                if int(check_response.status) != 200:
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": (
+                            "required check is unavailable (HTTP "
+                            + str(int(check_response.status))
+                            + ")"
+                        ),
+                        "criteria_bits": "",
+                        "check_hash": "",
+                        "rubric_hash": rubric_hash_copy,
+                        "evidence_hash": evidence_hash,
+                        "excerpt": excerpt,
+                    }
+
+                check_body = check_response.body or b""
+
+                if len(check_body) > MAX_EVIDENCE_BYTES:
+                    raise gl.vm.UserError("check response is too large")
+
+                try:
+                    check_payload = json.loads(
+                        check_body.decode("utf-8", errors="replace")
+                    )
+                except Exception:
+                    raise gl.vm.UserError(
+                        "check response is not valid JSON"
+                    )
+
+                check_state, check_canonical = _summarize_check_runs(
+                    check_payload,
+                    required_check_copy,
+                    commit,
+                )
+
+                # Bound to this commit and this check name, so validators
+                # agree on what was observed, not merely on the verdict.
+                check_hash = Keccak256(
+                    (
+                        required_check_copy
+                        + "@"
+                        + check_api_url
+                        + "#"
+                        + check_state
+                        + "#"
+                        + check_canonical
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                if check_state == "UNRESOLVED":
+                    return {
+                        "outcome": "UNAVAILABLE",
+                        "approved": False,
+                        "reason": (
+                            "required check has not completed for this commit"
+                        ),
+                        "criteria_bits": "",
+                        "check_hash": check_hash,
+                        "rubric_hash": rubric_hash_copy,
+                        "evidence_hash": evidence_hash,
+                        "excerpt": excerpt,
+                    }
+
+                if check_state == "FAILED":
+                    # Objective rejection: no model call, and it consumes a
+                    # revision exactly like any other rejection.
+                    return {
+                        "outcome": "REJECTED",
+                        "approved": False,
+                        "reason": "required check did not pass for this commit",
+                        "criteria_bits": "0" * len(criteria_copy),
+                        "check_hash": check_hash,
+                        "rubric_hash": rubric_hash_copy,
+                        "evidence_hash": evidence_hash,
+                        "excerpt": excerpt,
+                    }
 
             prompt = _build_adjudication_prompt(
                 spec_copy,
@@ -1567,6 +1889,7 @@ class ProjectEscrow(gl.Contract):
                 "approved": approved,
                 "reason": reason,
                 "criteria_bits": criteria_bits,
+                "check_hash": check_hash,
                 "rubric_hash": rubric_hash_copy,
                 "evidence_hash": evidence_hash,
                 "excerpt": excerpt,
@@ -1595,6 +1918,8 @@ class ProjectEscrow(gl.Contract):
                     == validator_data["criteria_bits"]
                     and leader_result.calldata["rubric_hash"]
                     == validator_data["rubric_hash"]
+                    and leader_result.calldata["check_hash"]
+                    == validator_data["check_hash"]
                     and leader_result.calldata["excerpt"]
                     == validator_data["excerpt"]
                 )
@@ -1768,6 +2093,37 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         return False
+
+    def _report_outcome(self, party, outcome, milestone_index, amount):
+        """Tell the registry about a CONFIRMED terminal outcome.
+
+        Only confirmed events are reported: the value has actually left the
+        contract, so the registry never records work that was merely approved
+        or a transfer still in flight. The amount is the value that moved for
+        that event.
+
+        Reporting must never endanger the escrow. The call is emitted
+        fire-and-forget, so the registry executes in its own later
+        transaction and a rejection there cannot roll back payment or
+        accounting here, and the emit itself is guarded so even a malformed
+        registry address cannot break a confirmation.
+        """
+        if self.registry == Address(bytes(20)):
+            return
+
+        try:
+            gl.get_contract_at(self.registry).emit(
+                on="finalized"
+            ).record_outcome(
+                party.as_hex,
+                outcome,
+                milestone_index,
+                str(int(amount)),
+            )
+        except Exception:
+            # Reporting is observational. Losing a report is acceptable;
+            # losing a payment is not.
+            pass
 
     def _queue_refund_for_failed_milestone(self, milestone_index):
         """The single place principal is returned to the client.
@@ -2451,6 +2807,10 @@ class ProjectEscrow(gl.Contract):
                 milestone_index
             ] = "RELEASED"
 
+            self._report_outcome(
+                self.worker, "RELEASED", milestone_index, amount
+            )
+
             next_index = milestone_index + 1
 
             if next_index < len(self.milestone_statuses):
@@ -2487,6 +2847,10 @@ class ProjectEscrow(gl.Contract):
                 milestone_index
             ] = "REFUNDED"
 
+            self._report_outcome(
+                self.client, "REFUNDED", milestone_index, amount
+            )
+
             # Financial finality first, progression second.
             next_index = milestone_index + 1
 
@@ -2519,6 +2883,10 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "REFUNDED"
+
+            self._report_outcome(
+                self.client, "REFUNDED", milestone_index, amount
+            )
 
             # The project stops here, so every untouched future milestone is
             # terminal only now that its principal has actually gone back.
@@ -2563,9 +2931,15 @@ class ProjectEscrow(gl.Contract):
                 self.total_settled_worker = u256(
                     self.total_settled_worker + amount
                 )
+                self._report_outcome(
+                    self.worker, "SETTLED", milestone_index, amount
+                )
             else:
                 self.total_settled_client = u256(
                     self.total_settled_client + amount
+                )
+                self._report_outcome(
+                    self.client, "SETTLED", milestone_index, amount
                 )
 
         elif kind == "APPEAL_CREDIT_REFUND":
@@ -2887,6 +3261,52 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         self.project_status = "CLOSED"
+
+    @gl.public.view
+    def get_registry(self) -> str:
+        return self.registry.as_hex
+
+    @gl.public.view
+    def interface_id(self) -> str:
+        """Identifies the read interface, so a consumer can refuse unknown
+        versions rather than guess at field meanings."""
+        return ESCROW_INTERFACE_ID
+
+    @gl.public.view
+    def is_milestone_released(self, index: int) -> bool:
+        """True only for a milestone whose payout is confirmed sent."""
+        if index < 0 or index >= len(self.milestone_statuses):
+            raise gl.vm.UserError("milestone index out of range")
+
+        return self.milestone_statuses[index] == "RELEASED"
+
+    @gl.public.view
+    def released_amount(self, index: int) -> str:
+        """Decimal string. Zero unless the milestone reached RELEASED, so a
+        consumer can never read an amount that has not actually been paid."""
+        if index < 0 or index >= len(self.milestone_statuses):
+            raise gl.vm.UserError("milestone index out of range")
+
+        if self.milestone_statuses[index] != "RELEASED":
+            return "0"
+
+        return str(int(self.milestone_amounts[index]))
+
+    @gl.public.view
+    def parties(self) -> dict:
+        """Fixed-shape summary. Amounts are decimal strings, because a JS
+        consumer would otherwise receive a Number for small values and a
+        string for large ones (probe L1)."""
+        return {
+            "interface_id": ESCROW_INTERFACE_ID,
+            "client": self.client.as_hex,
+            "worker": self.worker.as_hex,
+            "project_status": self.project_status,
+            "milestone_count": str(len(self.milestone_statuses)),
+            "total_funded": str(int(self.total_funded)),
+            "total_released": str(int(self.total_released)),
+            "total_refunded": str(int(self.total_refunded)),
+        }
 
     @gl.public.view
     def get_project_status(self) -> str:
