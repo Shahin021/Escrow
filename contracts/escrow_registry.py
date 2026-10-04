@@ -35,6 +35,9 @@ class EscrowRegistry(gl.Contract):
     escrow_labels: DynArray[str]
     escrow_registered: TreeMap[Address, bool]
 
+    # Processed event keys, so a redelivered or replayed report is a no-op.
+    processed_events: TreeMap[str, bool]
+
     # Append-only report log.
     report_escrows: DynArray[Address]
     report_parties: DynArray[Address]
@@ -95,6 +98,12 @@ class EscrowRegistry(gl.Contract):
         The sender is the calling contract, so authentication is a lookup in
         escrow_registered. An unregistered caller is rejected outright rather
         than silently ignored, so a misconfigured deployment is visible.
+
+        Idempotent by event identity. An emitted message can be delivered
+        more than once, and a terminal milestone event happens exactly once
+        per (escrow, milestone, outcome), so that triple is the key. A repeat
+        returns quietly without touching the log or the tallies: raising
+        would turn a harmless redelivery into a failed transaction.
         """
         reporter = gl.message.sender_address
 
@@ -112,6 +121,26 @@ class EscrowRegistry(gl.Contract):
 
         party_address = Address(party)
         value = self._parse_amount(amount)
+
+        # Event identity is (escrow, milestone, outcome, party). The party
+        # belongs in the key because one event can pay two parties: a
+        # settlement produces a worker leg and a client leg for the same
+        # milestone index and outcome, and both are genuine.
+        event_key = (
+            reporter.as_hex
+            + ":"
+            + str(milestone_index)
+            + ":"
+            + outcome
+            + ":"
+            + party_address.as_hex
+        )
+
+        if self.processed_events.get(event_key, False):
+            # Already recorded: a duplicate delivery must not double-count.
+            return
+
+        self.processed_events[event_key] = True
 
         self.report_escrows.append(reporter)
         self.report_parties.append(party_address)
@@ -155,6 +184,26 @@ class EscrowRegistry(gl.Contract):
     @gl.public.view
     def interface_id(self) -> str:
         return REGISTRY_INTERFACE_ID
+
+    @gl.public.view
+    def is_event_processed(
+        self,
+        escrow: str,
+        milestone_index: int,
+        outcome: str,
+        party: str,
+    ) -> bool:
+        key = (
+            Address(escrow).as_hex
+            + ":"
+            + str(milestone_index)
+            + ":"
+            + outcome
+            + ":"
+            + Address(party).as_hex
+        )
+
+        return self.processed_events.get(key, False)
 
     @gl.public.view
     def get_owner(self) -> str:

@@ -33,11 +33,26 @@ resolved against the exact commit under review.
 
 | Observed | Result |
 | --- | --- |
-| Every run with that exact name completed successfully | rubric decides as usual |
-| A run with that name completed with any other conclusion | `REJECTED`, no model call, consumes a revision |
-| No run with that name, or any still queued or in progress | `UNAVAILABLE`, no revision consumed |
+| Selected run completed successfully | rubric decides as usual |
+| Selected run completed with any other conclusion | `REJECTED`, no model call, consumes a revision |
+| Selected run still queued or in progress | `UNAVAILABLE`, no revision consumed |
+| No run with that name bound to this commit | `UNAVAILABLE`, no revision consumed |
+| Response paginated or truncated (`total_count` exceeds the runs returned) | `UNAVAILABLE` |
+| The same check name published by more than one app | `UNAVAILABLE`, the name is ambiguous |
 | Non-200, including 403 and 429, or an unreachable host | `UNAVAILABLE`, no revision consumed |
 | Malformed payload | the transaction reverts with no state change |
+
+**Rerun handling.** GitHub keeps every attempt of a check, so a commit that
+failed and was rerun successfully still lists the old failing run. Treating
+each run as independently authoritative would let a stale failure reject work
+that now passes, and a rejection costs the worker a revision. Only runs whose
+`head_sha` equals the pinned commit are considered, and among those the run
+with the greatest `id` wins, because ids increase with each attempt. A run
+without a `head_sha` cannot be bound to the commit and is ignored.
+
+`check_hash` binds the selected run's id, the commit, its status and
+conclusion, so validators agree on which attempt decided, not merely on the
+verdict.
 
 A green check never approves on its own. The observed runs are reduced to a
 canonical sorted string and hashed with the check name and commit-bound URL
@@ -77,15 +92,43 @@ Known harness limit: deploying the same contract file twice in one glsim
 process trips the SDK's class registry, so the spoofing test uses a single
 instance across its registration boundary rather than two reporters.
 
-### Not wired into the escrow yet
+### Wiring into the escrow
 
-`ProjectEscrow` does **not** emit reports to a registry. Doing so would add an
-emitted call to terminal paths in frozen Phase 3 code, and Direct Mode cannot
-execute or observe it, so every existing Phase 1–3 test would exercise a
-branch that silently does nothing there. The registry is therefore delivered
-standalone and verified against a real emitted call from a reporter contract.
-Wiring it into the escrow is a deliberate follow-up, and belongs with the
-Bradbury deployment in Phase 6 where the delivery can actually be observed.
+`ProjectEscrow` takes an optional `registry` constructor argument. The zero
+address, which is the default, means no reporting, so existing deployments
+and every Phase 1–3 test are unaffected.
+
+Reports are emitted only from **confirmed** outflows, never from an approval
+or a transfer still in flight:
+
+| Confirmed outflow | Outcome | Party | Amount |
+| --- | --- | --- | --- |
+| `MILESTONE_PAYOUT` | `RELEASED` | worker | the payout that left the contract |
+| `MILESTONE_REFUND` | `REFUNDED` | client | that milestone's principal |
+| `PROJECT_REMAINDER_REFUND` | `REFUNDED` | client | the whole remaining principal |
+| `SETTLEMENT_WORKER` / `SETTLEMENT_CLIENT` | `SETTLED` | that leg's recipient | that leg's amount |
+
+Bond returns, forfeitures, credit refunds and unmatched sweeps are not
+reported: they are not milestone outcomes.
+
+**A registry failure can never cost money.** The call is emitted
+fire-and-forget, so the registry runs in its own later transaction and a
+rejection there cannot roll back payment or accounting, and the emit itself
+is guarded so even a malformed registry address cannot break a confirmation.
+This is tested end to end: an escrow pointed at a registry it was never
+registered with still completes its payout, with accounting intact and the
+report refused.
+
+### Replay protection
+
+`record_outcome` is idempotent. Event identity is
+`(escrow, milestone, outcome, party)`, persisted in `processed_events`, and a
+repeat returns quietly without touching the log or the tallies. Raising
+instead would turn a harmless redelivery into a failed transaction.
+
+The party belongs in the key because one event can legitimately pay two
+parties: a settlement produces a worker leg and a client leg for the same
+milestone and outcome.
 
 ## Verification status
 

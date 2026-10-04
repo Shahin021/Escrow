@@ -413,18 +413,29 @@ def _check_name_is_valid(name):
     return True
 
 
-def _summarize_check_runs(payload, wanted_name):
-    """Reduce a check-runs response to a deterministic verdict.
+def _summarize_check_runs(payload, wanted_name, commit):
+    """Select the authoritative check run for one commit, rerun-safe.
 
-    Returns (state, canonical) where state is one of:
-      "PASSED"      every run with this exact name completed successfully
-      "FAILED"      a run with this name completed without success
-      "UNRESOLVED"  no such run, or one still running
+    GitHub keeps every attempt of a check, so a commit that failed and was
+    then rerun successfully still lists the old failing run. Treating each
+    run as independently authoritative would let that stale failure reject
+    work that now passes, and a rejection costs the worker a revision.
 
-    Only runs whose name matches exactly are considered, so an unrelated
-    green job cannot stand in for the required one. The canonical string is
-    hashed into consensus, so validators must agree on the observed runs and
-    not merely on the verdict.
+    Policy, all deterministic:
+
+      * the response must be complete: total_count must equal the number of
+        runs returned, otherwise it is paginated or truncated and no safe
+        answer exists
+      * only runs whose name matches exactly AND whose head_sha equals the
+        pinned commit are considered; a run without a head_sha cannot be
+        bound to the commit and is ignored
+      * if those runs come from more than one app, the name is ambiguous and
+        no safe answer exists
+      * otherwise the run with the greatest id wins, because GitHub ids
+        increase with each attempt, so the newest attempt decides
+
+    Returns (state, canonical) where state is PASSED, FAILED or UNRESOLVED.
+    UNRESOLVED is always safe: it never approves and never burns a revision.
     """
     if not isinstance(payload, dict):
         raise gl.vm.UserError("check response is not a JSON object")
@@ -437,7 +448,18 @@ def _summarize_check_runs(payload, wanted_name):
     if len(runs) > MAX_CHECK_RUNS:
         raise gl.vm.UserError("check response lists too many runs")
 
-    observed = []
+    total = payload.get("total_count")
+
+    if not _is_json_int(total) or total < 0:
+        raise gl.vm.UserError("check response has no total_count")
+
+    if total != len(runs):
+        # Paginated or truncated: the decisive run may not even be here.
+        return "UNRESOLVED", "truncated:" + str(total) + ":" + str(len(runs))
+
+    selected_id = -1
+    selected = None
+    apps = []
 
     for run in runs:
         if not isinstance(run, dict):
@@ -448,11 +470,24 @@ def _summarize_check_runs(payload, wanted_name):
         if not isinstance(name, str) or name != wanted_name:
             continue
 
+        head_sha = run.get("head_sha")
+
+        if not isinstance(head_sha, str) or head_sha.lower() != commit:
+            # Not bound to the commit under review, so it says nothing
+            # about this evidence.
+            continue
+
+        run_id = run.get("id")
+
+        if not _is_json_int(run_id) or run_id < 0:
+            raise gl.vm.UserError("check run has no id")
+
         status = run.get("status")
-        conclusion = run.get("conclusion")
 
         if not isinstance(status, str):
             raise gl.vm.UserError("check run has no status")
+
+        conclusion = run.get("conclusion")
 
         if conclusion is None:
             conclusion = ""
@@ -460,21 +495,46 @@ def _summarize_check_runs(payload, wanted_name):
         if not isinstance(conclusion, str):
             raise gl.vm.UserError("check run conclusion is not a string")
 
-        observed.append(status + ":" + conclusion)
+        app = run.get("app")
+        app_id = ""
 
-    if len(observed) == 0:
-        return "UNRESOLVED", ""
+        if isinstance(app, dict) and _is_json_int(app.get("id")):
+            app_id = str(app.get("id"))
 
-    observed.sort()
-    canonical = "|".join(observed)
+        if app_id not in apps:
+            apps.append(app_id)
 
-    for entry in observed:
-        if not entry.startswith("completed:"):
-            return "UNRESOLVED", canonical
+        if run_id > selected_id:
+            selected_id = run_id
+            selected = (run_id, status, conclusion)
 
-    for entry in observed:
-        if entry != "completed:success":
-            return "FAILED", canonical
+    if selected is None:
+        return "UNRESOLVED", "none"
+
+    if len(apps) > 1:
+        apps.sort()
+        return "UNRESOLVED", "ambiguous:" + ",".join(apps)
+
+    run_id, status, conclusion = selected
+
+    # The selected run's identity and the commit are part of what validators
+    # must agree on, not just the verdict.
+    canonical = (
+        "run:"
+        + str(run_id)
+        + ":"
+        + commit
+        + ":"
+        + status
+        + ":"
+        + conclusion
+    )
+
+    if status != "completed":
+        return "UNRESOLVED", canonical
+
+    if conclusion != "success":
+        return "FAILED", canonical
 
     return "PASSED", canonical
 
@@ -836,6 +896,8 @@ class ProjectEscrow(gl.Contract):
     render_mode: str
     max_revisions: u32
     continue_after_refund: bool
+    # Optional outcome registry. Zero address means no reporting.
+    registry: Address
 
     project_status: str
 
@@ -948,6 +1010,7 @@ class ProjectEscrow(gl.Contract):
         render_mode: str = "text",
         max_revisions: int = 3,
         continue_after_refund: bool = False,
+        registry: str = "",
     ):
         if len(milestones_json) == 0:
             raise gl.vm.UserError("milestones are required")
@@ -1006,6 +1069,11 @@ class ProjectEscrow(gl.Contract):
         self.render_mode = render_mode
         self.max_revisions = u32(max_revisions)
         self.continue_after_refund = continue_after_refund
+
+        if len(registry.strip()) == 0:
+            self.registry = Address(bytes(20))
+        else:
+            self.registry = Address(registry)
 
         self.project_status = "AWAITING_DEPOSIT"
 
@@ -1750,6 +1818,7 @@ class ProjectEscrow(gl.Contract):
                 check_state, check_canonical = _summarize_check_runs(
                     check_payload,
                     required_check_copy,
+                    commit,
                 )
 
                 # Bound to this commit and this check name, so validators
@@ -2024,6 +2093,37 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         return False
+
+    def _report_outcome(self, party, outcome, milestone_index, amount):
+        """Tell the registry about a CONFIRMED terminal outcome.
+
+        Only confirmed events are reported: the value has actually left the
+        contract, so the registry never records work that was merely approved
+        or a transfer still in flight. The amount is the value that moved for
+        that event.
+
+        Reporting must never endanger the escrow. The call is emitted
+        fire-and-forget, so the registry executes in its own later
+        transaction and a rejection there cannot roll back payment or
+        accounting here, and the emit itself is guarded so even a malformed
+        registry address cannot break a confirmation.
+        """
+        if self.registry == Address(bytes(20)):
+            return
+
+        try:
+            gl.get_contract_at(self.registry).emit(
+                on="finalized"
+            ).record_outcome(
+                party.as_hex,
+                outcome,
+                milestone_index,
+                str(int(amount)),
+            )
+        except Exception:
+            # Reporting is observational. Losing a report is acceptable;
+            # losing a payment is not.
+            pass
 
     def _queue_refund_for_failed_milestone(self, milestone_index):
         """The single place principal is returned to the client.
@@ -2707,6 +2807,10 @@ class ProjectEscrow(gl.Contract):
                 milestone_index
             ] = "RELEASED"
 
+            self._report_outcome(
+                self.worker, "RELEASED", milestone_index, amount
+            )
+
             next_index = milestone_index + 1
 
             if next_index < len(self.milestone_statuses):
@@ -2743,6 +2847,10 @@ class ProjectEscrow(gl.Contract):
                 milestone_index
             ] = "REFUNDED"
 
+            self._report_outcome(
+                self.client, "REFUNDED", milestone_index, amount
+            )
+
             # Financial finality first, progression second.
             next_index = milestone_index + 1
 
@@ -2775,6 +2883,10 @@ class ProjectEscrow(gl.Contract):
             self.milestone_statuses[
                 milestone_index
             ] = "REFUNDED"
+
+            self._report_outcome(
+                self.client, "REFUNDED", milestone_index, amount
+            )
 
             # The project stops here, so every untouched future milestone is
             # terminal only now that its principal has actually gone back.
@@ -2819,9 +2931,15 @@ class ProjectEscrow(gl.Contract):
                 self.total_settled_worker = u256(
                     self.total_settled_worker + amount
                 )
+                self._report_outcome(
+                    self.worker, "SETTLED", milestone_index, amount
+                )
             else:
                 self.total_settled_client = u256(
                     self.total_settled_client + amount
+                )
+                self._report_outcome(
+                    self.client, "SETTLED", milestone_index, amount
                 )
 
         elif kind == "APPEAL_CREDIT_REFUND":
@@ -3143,6 +3261,10 @@ class ProjectEscrow(gl.Contract):
             i += 1
 
         self.project_status = "CLOSED"
+
+    @gl.public.view
+    def get_registry(self) -> str:
+        return self.registry.as_hex
 
     @gl.public.view
     def interface_id(self) -> str:

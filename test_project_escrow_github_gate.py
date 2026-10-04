@@ -67,14 +67,32 @@ def _expect_revert(message, fn):
     assert message in str(err.value)
 
 
-def _runs(*entries):
+def _run(name, status, conclusion, run_id=1, sha=COMMIT_A, app_id=1):
+    return {
+        "id": run_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "head_sha": sha,
+        "app": {"id": app_id, "slug": "github-actions"},
+    }
+
+
+def _runs(*entries, total=None):
+    """entries are (name, status, conclusion) tuples or full run dicts."""
+    runs = []
+
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict):
+            runs.append(entry)
+        else:
+            name, status, conclusion = entry
+            runs.append(_run(name, status, conclusion, run_id=index + 1))
+
     return json.dumps(
         {
-            "total_count": len(entries),
-            "check_runs": [
-                {"name": name, "status": status, "conclusion": conclusion}
-                for name, status, conclusion in entries
-            ],
+            "total_count": len(runs) if total is None else total,
+            "check_runs": runs,
         }
     )
 
@@ -336,7 +354,34 @@ def test_a_check_on_another_commit_is_never_consulted(
     assert int(escrow.get_milestone_revision_count(0)) == 0
 
 
-def test_mixed_runs_under_the_same_name_must_all_succeed(
+def test_a_successful_rerun_supersedes_an_older_failure(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """The bug this policy fixes.
+
+    GitHub keeps every attempt, so a commit that failed and was rerun
+    successfully still lists the old failing run. The newest attempt must
+    decide, or a stale failure would cost the worker a revision.
+    """
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _mock_evidence(direct_vm)
+    _mock_api(
+        direct_vm,
+        _runs(
+            _run(CHECK, "completed", "failure", run_id=10),
+            _run(CHECK, "completed", "success", run_id=11),
+        ),
+    )
+    _mock_llm(direct_vm, [True])
+
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "APPROVED"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+
+
+def test_a_failing_rerun_supersedes_an_older_success(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
     escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
@@ -345,25 +390,130 @@ def test_mixed_runs_under_the_same_name_must_all_succeed(
     _mock_api(
         direct_vm,
         _runs(
-            (CHECK, "completed", "success"),
-            (CHECK, "completed", "failure"),
+            _run(CHECK, "completed", "success", run_id=10),
+            _run(CHECK, "completed", "failure", run_id=11),
         ),
     )
 
     escrow.resolve(0)
 
-    assert escrow.get_milestone_status(0) == "REVISION_REQUIRED"
     assert escrow.get_attempt_verdict(0) == "REJECTED"
+    assert int(escrow.get_milestone_revision_count(0)) == 1
+
+
+def test_a_pending_rerun_is_unresolved_not_a_stale_pass(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _mock_evidence(direct_vm)
+    _mock_api(
+        direct_vm,
+        _runs(
+            _run(CHECK, "completed", "success", run_id=10),
+            _run(CHECK, "in_progress", None, run_id=11),
+        ),
+    )
+
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+
+
+def test_runs_for_another_head_sha_are_ignored(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _mock_evidence(direct_vm)
+    # A green run exists in this very response, but it belongs to a
+    # different commit, so it must not count.
+    _mock_api(
+        direct_vm,
+        _runs(_run(CHECK, "completed", "success", run_id=9, sha=COMMIT_B)),
+    )
+
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+
+
+def test_a_run_without_a_head_sha_cannot_decide(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    run = _run(CHECK, "completed", "success", run_id=5)
+    del run["head_sha"]
+
+    _mock_evidence(direct_vm)
+    _mock_api(direct_vm, _runs(run))
+
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+
+
+def test_same_name_from_two_apps_is_ambiguous(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _mock_evidence(direct_vm)
+    _mock_api(
+        direct_vm,
+        _runs(
+            _run(CHECK, "completed", "success", run_id=1, app_id=1),
+            _run(CHECK, "completed", "failure", run_id=2, app_id=2),
+        ),
+    )
+
+    # Two different apps publishing the same check name: no safe answer, so
+    # neither a false approval nor a false rejection.
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
+
+
+def test_truncated_or_paginated_response_is_unresolved(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    escrow = _ready(direct_vm, direct_deploy, direct_owner, direct_alice)
+
+    _mock_evidence(direct_vm)
+    # total_count says there are more runs than were returned, so the
+    # decisive attempt may be on another page.
+    _mock_api(
+        direct_vm,
+        _runs(_run(CHECK, "completed", "success", run_id=1), total=37),
+    )
+
+    escrow.resolve(0)
+
+    assert escrow.get_milestone_status(0) == "EVIDENCE_UNAVAILABLE"
+    assert int(escrow.get_milestone_revision_count(0)) == 0
 
 
 @pytest.mark.parametrize(
     "body,message",
     [
         ("not json", "check response is not valid JSON"),
-        ('{"check_runs": "nope"}', "check response has no check_runs array"),
+        ('{"total_count": 0, "check_runs": "nope"}',
+         "check response has no check_runs array"),
         ('[]', "check response is not a JSON object"),
-        ('{"check_runs": [1]}', "check run is not a JSON object"),
-        ('{"check_runs": [{"name": "test"}]}', "check run has no status"),
+        ('{"total_count": 1, "check_runs": [1]}',
+         "check run is not a JSON object"),
+        ('{"check_runs": [], "total_count": "x"}',
+         "check response has no total_count"),
+        ('{"check_runs": []}', "check response has no total_count"),
+        ('{"total_count": 1, "check_runs": [{"name": "test", '
+         '"head_sha": "' + COMMIT_A + '"}]}', "check run has no id"),
+        ('{"total_count": 1, "check_runs": [{"name": "test", "id": 1, '
+         '"head_sha": "' + COMMIT_A + '"}]}', "check run has no status"),
     ],
 )
 def test_malformed_check_responses_revert_without_mutation(

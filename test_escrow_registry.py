@@ -163,7 +163,6 @@ def test_tallies_accumulate_per_party_and_outcome(engine):
 
     for outcome, amount in (
         ("RELEASED", "100"),
-        ("RELEASED", "250"),
         ("REFUNDED", "0"),
         ("SETTLED", "0"),
         ("CANCELLED", "0"),
@@ -176,8 +175,8 @@ def test_tallies_accumulate_per_party_and_outcome(engine):
 
     stats = engine.call_method(registry, "get_stats", [PARTY])
 
-    assert stats["released_count"] == "2"
-    assert stats["released_value"] == "350"
+    assert stats["released_count"] == "1"
+    assert stats["released_value"] == "100"
     assert stats["refunded_count"] == "1"
     assert stats["settled_count"] == "1"
     assert stats["cancelled_count"] == "1"
@@ -188,7 +187,7 @@ def test_tallies_accumulate_per_party_and_outcome(engine):
     assert other["released_count"] == "0"
     assert other["released_value"] == "0"
 
-    assert engine.call_method(registry, "report_count") == "5"
+    assert engine.call_method(registry, "report_count") == "4"
 
 
 @pytest.mark.parametrize(
@@ -215,6 +214,104 @@ def test_invalid_reports_are_rejected(engine, outcome, amount):
 
     # The emitted call was delivered and refused, so nothing was recorded.
     assert engine.call_method(registry, "report_count") == "0"
+
+
+def test_duplicate_delivery_is_a_no_op(engine):
+    """An emitted message can arrive more than once, and a terminal event
+    happens once per (escrow, milestone, outcome)."""
+    registry, reporter = _deploy_pair(engine)
+
+    _register(engine, registry, reporter)
+
+    for _ in range(3):
+        engine.call_method(
+            reporter,
+            "report",
+            [registry, PARTY, "RELEASED", 0, "1000"],
+        )
+
+    assert engine.call_method(registry, "report_count") == "1"
+
+    stats = engine.call_method(registry, "get_stats", [PARTY])
+
+    assert stats["released_count"] == "1"
+    assert stats["released_value"] == "1000"
+
+    assert (
+        engine.call_method(
+            registry, "is_event_processed", [reporter, 0, "RELEASED", PARTY]
+        )
+        is True
+    )
+
+
+def test_replay_with_a_different_amount_cannot_inflate_value(engine):
+    registry, reporter = _deploy_pair(engine)
+
+    _register(engine, registry, reporter)
+
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "RELEASED", 0, "1000"]
+    )
+    # A replayed event claiming a larger amount must change nothing.
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "RELEASED", 0, "999999"]
+    )
+
+    stats = engine.call_method(registry, "get_stats", [PARTY])
+
+    assert stats["released_value"] == "1000"
+    assert engine.call_method(registry, "report_count") == "1"
+
+
+def test_the_same_event_for_two_parties_is_not_deduplicated(engine):
+    """A settlement pays both parties for the same milestone and outcome, so
+    the party is part of the event identity."""
+    registry, reporter = _deploy_pair(engine)
+
+    _register(engine, registry, reporter)
+
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "SETTLED", 0, "600"]
+    )
+    engine.call_method(
+        reporter, "report", [registry, OTHER, "SETTLED", 0, "400"]
+    )
+
+    assert engine.call_method(registry, "report_count") == "2"
+    assert (
+        engine.call_method(registry, "get_stats", [PARTY])["settled_count"]
+        == "1"
+    )
+    assert (
+        engine.call_method(registry, "get_stats", [OTHER])["settled_count"]
+        == "1"
+    )
+
+
+def test_distinct_events_are_still_recorded_separately(engine):
+    registry, reporter = _deploy_pair(engine)
+
+    _register(engine, registry, reporter)
+
+    # Same escrow, different milestones and different outcomes are genuinely
+    # different events.
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "RELEASED", 0, "100"]
+    )
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "RELEASED", 1, "200"]
+    )
+    engine.call_method(
+        reporter, "report", [registry, PARTY, "REFUNDED", 0, "0"]
+    )
+
+    stats = engine.call_method(registry, "get_stats", [PARTY])
+
+    assert stats["released_count"] == "2"
+    assert stats["released_value"] == "300"
+    assert stats["refunded_count"] == "1"
+    assert engine.call_method(registry, "report_count") == "3"
 
 
 def test_registry_exposes_its_interface_id(engine):
