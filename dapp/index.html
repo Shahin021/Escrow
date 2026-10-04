@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Milestone escrow</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <main id="app">
+      <h1>Milestone escrow</h1>
+      <p id="config-banner" class="banner"></p>
+      <section id="wallet">
+        <button id="connect" type="button">Connect wallet</button>
+        <button id="disconnect" type="button" hidden>Disconnect</button>
+        <p id="account"></p>
+      </section>
+      <section id="project"></section>
+      <section id="milestones"></section>
+      <section id="actions"></section>
+      <p id="tx-status" role="status"></p>
+    </main>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "escrow-v3-dapp",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Phase 5 wallet-connected dApp for EscrowWithIntelligentReview V3.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "genlayer-js": "1.1.8"
+  },
+  "devDependencies": {
+    "vite": "5.4.11",
+    "vitest": "2.1.8"
+  }
+}
