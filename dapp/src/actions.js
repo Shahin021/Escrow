@@ -32,7 +32,6 @@ const PERMISSIONLESS = new Set([
   "resolve",
   "mark_review_stalled",
   "expire_delivery",
-  "expire_unavailable",
   "finalize_rejection",
   "emit_next_outflow",
   "confirm_outflow",
@@ -102,7 +101,7 @@ export function availableActions({ role, project, milestone }) {
 
     if (status === "APPROVED") add("claim_payment", "Claim payment");
 
-    if (status === "REJECTED_FINAL" && !milestone.appealUsed) {
+    if (milestone && milestone.appealable) {
       add("appeal", "Appeal the rejection");
     }
 
@@ -132,7 +131,12 @@ export function availableActions({ role, project, milestone }) {
     }
   }
 
-  if (status === "UNDER_REVIEW" || status === "EVIDENCE_UNAVAILABLE") {
+  if (
+    status === "UNDER_REVIEW" ||
+    status === "EVIDENCE_UNAVAILABLE" ||
+    status === "REVIEW_STALLED" ||
+    status === "UNDER_APPEAL"
+  ) {
     add("resolve", "Run review");
   }
 
@@ -144,12 +148,16 @@ export function availableActions({ role, project, milestone }) {
     add("expire_delivery", "Expire the delivery deadline");
   }
 
-  if (status === "REJECTED_FINAL" && milestone.finalizable) {
+  if (milestone && milestone.finalizable) {
     add("finalize_rejection", "Finalize the rejection");
   }
 
   if (project.hasConfirmableOutflow) {
     add("confirm_outflow", "Confirm the pending transfer");
+  }
+
+  if (project.hasQueuedOutflow && !project.hasConfirmableOutflow) {
+    add("emit_next_outflow", "Emit the next queued transfer");
   }
 
   if (project.unmatchedHeld && project.unmatchedHeld !== "0") {

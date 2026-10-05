@@ -29,11 +29,14 @@ const project = (overrides = {}) => ({
   ...overrides,
 });
 
+// Timing flags mirror what predicates.js derives from the contract's own
+// timestamp views, so these unit tests and the controller tests agree.
 const milestone = (overrides = {}) => ({
   index: 0,
   status: "AWAITING_DELIVERY",
   appealUsed: false,
   appealOpen: false,
+  appealable: false,
   appealAbortable: false,
   stallable: false,
   expirable: false,
@@ -126,7 +129,7 @@ describe("worker workflow", () => {
       availableActions({
         role: ROLE_WORKER,
         project: project(),
-        milestone: milestone({ status: "REJECTED_FINAL" }),
+        milestone: milestone({ status: "REJECTED_FINAL", appealable: true }),
       }),
     );
 
@@ -136,7 +139,11 @@ describe("worker workflow", () => {
       availableActions({
         role: ROLE_WORKER,
         project: project(),
-        milestone: milestone({ status: "REJECTED_FINAL", appealUsed: true }),
+        milestone: milestone({
+          status: "REJECTED_FINAL",
+          appealUsed: true,
+          appealable: false,
+        }),
       }),
     );
 
