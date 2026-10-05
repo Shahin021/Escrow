@@ -494,8 +494,8 @@ describe("proposer versus counterparty, and permissionless calls", () => {
 
     const asClient = await loaded(scenario, { account: CLIENT });
     const clientActions = asClient.controller
-      .actionsByMilestone()[0]
-      .actions.map((a) => a.action);
+      .projectActions()
+      .map((a) => a.action);
 
     expect(clientActions).toContain("withdraw_settlement");
     expect(clientActions).not.toContain("accept_settlement");
@@ -510,8 +510,8 @@ describe("proposer versus counterparty, and permissionless calls", () => {
 
     const asWorker = await loaded(scenario, { account: WORKER });
     const workerActions = asWorker.controller
-      .actionsByMilestone()[0]
-      .actions.map((a) => a.action);
+      .projectActions()
+      .map((a) => a.action);
 
     expect(workerActions).toContain("accept_settlement");
     expect(workerActions).not.toContain("withdraw_settlement");
@@ -545,9 +545,7 @@ describe("proposer versus counterparty, and permissionless calls", () => {
     });
     const { controller, client } = await loaded(scenario);
 
-    const actions = controller
-      .actionsByMilestone()[0]
-      .actions.map((a) => a.action);
+    const actions = controller.projectActions().map((a) => a.action);
 
     expect(actions).toContain("emit_next_outflow");
 
@@ -574,11 +572,169 @@ describe("proposer versus counterparty, and permissionless calls", () => {
       { account: CLIENT },
     );
 
-    const busyActions = busy.controller
-      .actionsByMilestone()[0]
-      .actions.map((a) => a.action);
+    const busyActions = busy.controller.projectActions().map((a) => a.action);
 
     expect(busyActions).toContain("confirm_outflow");
     expect(busyActions).not.toContain("close_project");
+  });
+});
+
+describe("account switching cannot reuse the old signer", () => {
+  /** Each fake client is bound to the account it was created for. */
+  function boundClient(scenario, account) {
+    const client = fakeClient(scenario);
+    const write = client.writeContract;
+
+    client.boundTo = account;
+    client.writeContract = vi.fn(async (call) => {
+      if (client.boundTo !== client.currentSigner) {
+        throw new Error(
+          `client bound to ${client.boundTo} cannot sign for ${client.currentSigner}`,
+        );
+      }
+
+      return write.call(client, call);
+    });
+    client.currentSigner = account;
+
+    return client;
+  }
+
+  it("drops the old client and blocks writes until reconnect", async () => {
+    const scenario = chainState();
+    const workerClient = boundClient(scenario, WORKER);
+    const controller = createController({ config, networkInfo });
+
+    controller.setWallet({ client: workerClient, account: WORKER, chainId: 4221 });
+    await controller.refresh(workerClient, NOW);
+
+    expect(controller.writesEnabled).toBe(true);
+
+    // The wallet switches to the client's account.
+    controller.setAccount(CLIENT);
+
+    expect(controller.state.account).toBe(CLIENT);
+    expect(controller.role()).toBe("client");
+
+    // The stale, worker-bound client must not be used.
+    expect(controller.state.client).toBeNull();
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.reconnectWarning).toMatch(/Reconnect to sign as/);
+
+    await expect(
+      controller.dispatch("propose_settlement", {
+        input: { to_worker: "600", to_client: "400" },
+      }),
+    ).rejects.toThrow(/Reconnect to sign as/);
+
+    expect(workerClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("works again once a client for the new account is supplied", async () => {
+    const scenario = chainState();
+    const workerClient = boundClient(scenario, WORKER);
+    const controller = createController({ config, networkInfo });
+
+    controller.setWallet({ client: workerClient, account: WORKER, chainId: 4221 });
+    await controller.refresh(workerClient, NOW);
+
+    controller.setAccount(CLIENT);
+
+    const clientClient = boundClient(scenario, CLIENT);
+
+    controller.setWallet({ client: clientClient, account: CLIENT, chainId: 4221 });
+    await controller.refresh(clientClient, NOW);
+
+    expect(controller.writesEnabled).toBe(true);
+    expect(controller.reconnectWarning).toBeNull();
+
+    await controller.dispatch("propose_settlement", {
+      input: { to_worker: "600", to_client: "400" },
+    });
+
+    expect(clientClient.writeContract).toHaveBeenCalledTimes(1);
+    expect(workerClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("disables writes when the wallet disconnects every account", async () => {
+    const scenario = chainState();
+    const client = boundClient(scenario, WORKER);
+    const controller = createController({ config, networkInfo });
+
+    controller.setWallet({ client, account: WORKER, chainId: 4221 });
+    await controller.refresh(client, NOW);
+
+    controller.setAccount(null);
+
+    expect(controller.state.account).toBeNull();
+    expect(controller.state.client).toBeNull();
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.role()).toBe("observer");
+
+    await expect(
+      controller.dispatch("resolve", { milestoneIndex: 0 }),
+    ).rejects.toThrow(/Writes are disabled|Reconnect/);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+  });
+});
+
+describe("project actions are not repeated per milestone", () => {
+  it("lists project-wide actions once across several milestones", async () => {
+    const scenario = chainState({
+      milestoneCount: 3,
+      milestones: [
+        { status: "RELEASED", amount: "300" },
+        { status: "AWAITING_DELIVERY", amount: "400" },
+        { status: "LOCKED", amount: "300" },
+      ],
+      appeal_credit_held: "50",
+    });
+    const { controller } = await loaded(scenario, { account: WORKER });
+
+    const projectActions = controller.projectActions().map((a) => a.action);
+    const rows = controller.actionsByMilestone();
+
+    expect(rows).toHaveLength(3);
+
+    // Project-wide work appears exactly once, in the project section.
+    for (const action of [
+      "fund_appeal_credit",
+      "withdraw_appeal_credit",
+      "propose_settlement",
+    ]) {
+      expect(projectActions.filter((a) => a === action)).toHaveLength(1);
+
+      const repeated = rows.flatMap((row) =>
+        row.actions.map((a) => a.action).filter((a) => a === action),
+      );
+
+      expect(repeated).toEqual([]);
+    }
+
+    // Milestone work stays with its milestone.
+    expect(rows[1].actions.map((a) => a.action)).toContain("submit_deliverable");
+    expect(rows[0].actions.map((a) => a.action)).not.toContain("submit_deliverable");
+  });
+
+  it("keeps settling and closing in the project section only", async () => {
+    const scenario = chainState({
+      status: "SETTLING",
+      locked: "0",
+      milestoneCount: 2,
+      milestones: [
+        { status: "CANCELLED", amount: "600" },
+        { status: "CANCELLED", amount: "400" },
+      ],
+    });
+    const { controller } = await loaded(scenario, { account: CLIENT });
+
+    expect(controller.projectActions().map((a) => a.action)).toContain(
+      "close_project",
+    );
+
+    for (const row of controller.actionsByMilestone()) {
+      expect(row.actions.map((a) => a.action)).not.toContain("close_project");
+    }
   });
 });

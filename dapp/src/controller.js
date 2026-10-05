@@ -6,7 +6,12 @@
  * what this returns; tests drive it directly.
  */
 
-import { availableActions, roleOf, writesEnabled } from "./actions.js";
+import {
+  availableActions,
+  isProjectScoped,
+  roleOf,
+  writesEnabled,
+} from "./actions.js";
 import { readMilestone, readOutflows, readProject, sendAction } from "./escrow.js";
 import { buildCall } from "./methods.js";
 import { milestonePredicates, outflowActions, projectPredicates } from "./predicates.js";
@@ -22,6 +27,7 @@ export function createController({ config, networkInfo }) {
     milestones: [],
     outflows: [],
     now: 0,
+    needsReconnect: false,
     txState: TX_IDLE,
     lastError: null,
   };
@@ -33,14 +39,32 @@ export function createController({ config, networkInfo }) {
       state.client = client || null;
       state.account = account || null;
       state.chainId = chainId === undefined ? state.chainId : chainId;
+      state.needsReconnect = false;
     },
 
     setChainId(chainId) {
       state.chainId = chainId;
     },
 
+    /**
+     * Handle a wallet account change.
+     *
+     * The SDK client is bound to the account it was created with, so keeping
+     * it after a switch would let the UI show one account while transactions
+     * were signed by another. The client is therefore discarded and writes
+     * stay disabled until the user reconnects explicitly.
+     */
     setAccount(account) {
-      state.account = account;
+      const changed =
+        String(account || "").toLowerCase() !==
+        String(state.account || "").toLowerCase();
+
+      state.account = account || null;
+
+      if (changed) {
+        state.client = null;
+        state.needsReconnect = Boolean(account);
+      }
     },
 
     get correctNetwork() {
@@ -53,6 +77,13 @@ export function createController({ config, networkInfo }) {
         connected: Boolean(state.account && state.client),
         correctNetwork: api.correctNetwork,
       });
+    },
+
+    get reconnectWarning() {
+      return state.needsReconnect
+        ? "The wallet switched accounts. Reconnect to sign as " +
+            `${state.account}; the previous session cannot sign for it.`
+        : null;
     },
 
     get networkWarning() {
@@ -106,6 +137,20 @@ export function createController({ config, networkInfo }) {
       return roleOf(state.account, state.project);
     },
 
+    /**
+     * Project-wide actions, computed once. Funding, settlement, outflow
+     * handling, sweeping and closing belong to the project, so repeating them
+     * under every milestone would be noise and would suggest they differ per
+     * milestone.
+     */
+    projectActions() {
+      return availableActions({
+        role: api.role(),
+        project: state.project,
+        milestone: null,
+      }).filter((entry) => isProjectScoped(entry.action));
+    },
+
     /** Actions per milestone, so every milestone is actionable, not just #0. */
     actionsByMilestone() {
       const role = api.role();
@@ -113,7 +158,11 @@ export function createController({ config, networkInfo }) {
       return state.milestones.map((milestone) => ({
         milestoneIndex: milestone.index,
         status: milestone.status,
-        actions: availableActions({ role, project: state.project, milestone }),
+        actions: availableActions({
+          role,
+          project: state.project,
+          milestone,
+        }).filter((entry) => !isProjectScoped(entry.action)),
       }));
     },
 
@@ -144,7 +193,8 @@ export function createController({ config, networkInfo }) {
     async dispatch(action, { milestoneIndex = 0, input = {}, outflowId } = {}) {
       if (!api.writesEnabled) {
         throw new Error(
-          api.networkWarning ||
+          api.reconnectWarning ||
+            api.networkWarning ||
             "Writes are disabled: connect a wallet and configure a deployed escrow.",
         );
       }

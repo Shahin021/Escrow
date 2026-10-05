@@ -26,6 +26,28 @@ export function roleOf(account, project) {
   return ROLE_OBSERVER;
 }
 
+/**
+ * Actions that belong to the project rather than to one milestone. They are
+ * rendered once, not repeated under every milestone.
+ */
+export const PROJECT_ACTIONS = new Set([
+  "fund",
+  "fund_appeal_credit",
+  "withdraw_appeal_credit",
+  "propose_settlement",
+  "accept_settlement",
+  "withdraw_settlement",
+  "emit_next_outflow",
+  "confirm_outflow",
+  "redirect_outflow",
+  "sweep_unmatched",
+  "close_project",
+]);
+
+export function isProjectScoped(action) {
+  return PROJECT_ACTIONS.has(action);
+}
+
 // Actions the contract allows any caller to make, because they are
 // deterministic and cannot redirect value.
 const PERMISSIONLESS = new Set([

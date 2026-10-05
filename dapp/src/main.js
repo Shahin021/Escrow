@@ -75,7 +75,10 @@ function renderWallet() {
   el("connect").hidden = Boolean(account);
   el("disconnect").hidden = !account;
 
-  setText(el("network-warning"), controller.networkWarning || "");
+  setText(
+    el("network-warning"),
+    controller.reconnectWarning || controller.networkWarning || "",
+  );
 }
 
 function renderProject() {
@@ -122,6 +125,17 @@ function actionBlock(action, scope, milestoneIndex, outflowId) {
         <button type="submit">${method.label}</button>
       </fieldset>
     </form>`;
+}
+
+function renderProjectActions() {
+  const actions = controller.projectActions();
+
+  el("actions").innerHTML = actions.length
+    ? `<h2>Project actions</h2>` +
+      actions
+        .map((a) => actionBlock(a.action, `p-${a.action}`, null))
+        .join("")
+    : "";
 }
 
 function renderMilestones() {
@@ -203,6 +217,7 @@ function render() {
   renderConfig();
   renderWallet();
   renderProject();
+  renderProjectActions();
   renderMilestones();
   renderOutflows();
   bindForms();
@@ -238,6 +253,8 @@ el("connect").addEventListener("click", async () => {
     unwatch();
     unwatch = watchWallet(provider, {
       onAccountsChanged: (next) => {
+        // The client is bound to the old account, so the controller drops it
+        // and writes stay disabled until the user reconnects.
         controller.setAccount(next);
         refresh();
       },

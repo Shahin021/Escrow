@@ -87,6 +87,21 @@ from a successful `connect()`. The app subscribes to `accountsChanged` and
 `chainChanged`, follows an account into its new role, and disables writes on
 a chain mismatch with an explicit warning.
 
+**An account switch invalidates the signer.** The SDK client is bound to the
+account it was created with, so keeping it after a switch would let the UI
+show one account while transactions were signed by another. On
+`accountsChanged` the client is discarded and writes stay disabled, with a
+visible prompt, until the user reconnects for the new account. Switching to
+no account does the same and returns the app to observer mode.
+
+## Project actions versus milestone actions
+
+Funding, appeal credit, settlement, transfer handling, sweeping and closing
+belong to the project, so they are rendered **once** in a project section.
+Only genuinely milestone-scoped work (submission, replacement, review, claim,
+appeal, abort, finalization, expiry, stall marking) is rendered under each
+milestone, labelled with its index.
+
 ## Transaction progress
 
 States are `submitted`, `accepted`, `finalized` and `failed`. Acceptance is
@@ -114,6 +129,9 @@ exist.
 * Network-mismatch handling assumes `client.connect()` performs the chain
   switch it documents; this is not verified against a live wallet here.
 * The registry views are not surfaced in the UI.
+* Reconnecting after an account switch is manual: the app invalidates the old
+  signer and asks the user to reconnect rather than silently rebuilding a
+  client for an account they may not have intended to use.
 * Timing predicates are compared against the browser's clock, since there is
   no chain-time view to read before a transaction; the contract re-checks
   every deadline itself, so a wrong local clock can only show a button that
