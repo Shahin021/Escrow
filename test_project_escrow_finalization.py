@@ -159,6 +159,9 @@ def _rejected(
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, TOTAL)
 
     direct_vm.sender = direct_alice
@@ -312,6 +315,9 @@ def test_cannot_finalize_a_milestone_that_is_not_finally_rejected(
         escrow.fund()
     finally:
         direct_vm.value = 0
+
+
+    escrow.activate_funding()
 
     set_chain_time(at(T0_EPOCH + 100 * DAY))
 

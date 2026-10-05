@@ -981,6 +981,11 @@ class ProjectEscrow(gl.Contract):
     # that performs no eligibility checks, because probe L9 showed that value
     # attached to a payable method which later raises stays with the contract
     # while the state that would have recorded it is rolled back.
+    # Deposit credit: client value accounted on arrival, before any
+    # validation that the client could get wrong.
+    deposit_credit_held: u256
+    total_deposits_received: u256
+    total_deposits_refunded: u256
     appeal_credit_held: u256
     total_appeal_credit_received: u256
     total_appeal_credit_refunded: u256
@@ -1089,6 +1094,9 @@ class ProjectEscrow(gl.Contract):
 
         self.total_released = u256(0)
         self.total_refunded = u256(0)
+        self.deposit_credit_held = u256(0)
+        self.total_deposits_received = u256(0)
+        self.total_deposits_refunded = u256(0)
         self.appeal_credit_held = u256(0)
         self.total_appeal_credit_received = u256(0)
         self.total_appeal_credit_refunded = u256(0)
@@ -1274,24 +1282,118 @@ class ProjectEscrow(gl.Contract):
 
     @gl.public.write.payable
     def fund(self) -> None:
+        """Accept a deposit. Deliberately free of user-trippable checks.
+
+        Probe L9 showed live on Bradbury that value attached to a payable
+        method which then raises stays with the contract while the state
+        write is rolled back. The previous version of this method raised on
+        the wrong sender, the wrong project status and the wrong amount, so a
+        mistyped deposit left value in no bucket at all: unrecoverable, and
+        worse, it broke every later confirm_outflow, whose expected balance is
+        derived from the ledger.
+
+        So nothing here can revert on a caller mistake. The value is credited
+        and funding is activated separately by activate_funding(), which is
+        non-payable and may therefore reject freely.
+        """
+        value = gl.message.value
+
+        if value == u256(0):
+            # Nothing was attached, so raising cannot strand anything.
+            raise gl.vm.UserError("no value attached")
+
+        if (
+            gl.message.sender_address == self.client
+            and self.project_status == "AWAITING_DEPOSIT"
+        ):
+            self.deposit_credit_held = u256(
+                self.deposit_credit_held + value
+            )
+            self.total_deposits_received = u256(
+                self.total_deposits_received + value
+            )
+
+            return
+
+        # Anyone else, or a deposit after funding is settled: unattributable
+        # to a deposit, so it joins the unmatched bucket and leaves through
+        # sweep_unmatched() to the client. Refusing it would strand it.
+        self.unmatched_returns = u256(
+            self.unmatched_returns + value
+        )
+        self.unmatched_held = u256(
+            self.unmatched_held + value
+        )
+
+    @gl.public.write
+    def activate_funding(self) -> None:
+        """Turn an exact deposit into locked principal.
+
+        Non-payable, so every check here is safe: a revert carries no value
+        and leaves the credit untouched and withdrawable.
+        """
         if gl.message.sender_address != self.client:
-            raise gl.vm.UserError("only the client can fund this project")
+            raise gl.vm.UserError("only the client can activate funding")
 
         if self.project_status != "AWAITING_DEPOSIT":
             raise gl.vm.UserError(
                 f"cannot fund from status {self.project_status}"
             )
 
-        if gl.message.value != self.total_required:
+        credit = int(self.deposit_credit_held)
+        required = int(self.total_required)
+
+        if credit != required:
             raise gl.vm.UserError(
-                "sent value does not match the total required amount"
+                "deposit credit of "
+                + str(credit)
+                + " does not match the required "
+                + str(required)
             )
 
-        self.total_funded = u256(self.total_required)
-        self.locked = u256(self.total_required)
+        # Atomic: the credit becomes locked principal in one step, so it is
+        # never counted in both buckets and never in neither.
+        self.deposit_credit_held = u256(0)
+        self.total_funded = u256(required)
+        self.locked = u256(required)
 
         self.project_status = "ACTIVE"
         self._activate_milestone(0)
+
+    @gl.public.write
+    def withdraw_deposit_credit(self, amount: str) -> None:
+        """Return unused deposit credit to the client.
+
+        Uses the same serialized outflow engine as every other payment, so a
+        bounced refund lands in bounced_held and is redirectable by the
+        client.
+        """
+        if gl.message.sender_address != self.client:
+            raise gl.vm.UserError(
+                "only the client can withdraw deposit credit"
+            )
+
+        value = _parse_amount(amount)
+
+        if value == 0:
+            raise gl.vm.UserError("amount must be positive")
+
+        if int(self.deposit_credit_held) < value:
+            raise gl.vm.UserError("insufficient deposit credit")
+
+        self.deposit_credit_held = u256(
+            int(self.deposit_credit_held) - value
+        )
+        self.queued_out = u256(self.queued_out + u256(value))
+
+        self.outflow_kinds.append("DEPOSIT_REFUND")
+        self.outflow_milestones.append(u32(0))
+        self.outflow_recipients.append(self.client)
+        self.outflow_amounts.append(u256(value))
+        self.outflow_statuses.append("QUEUED")
+        self.outflow_balance_before.append(u256(0))
+
+        self._emit_one_queued_outflow()
 
     def _now(self):
         """The single Phase 3 time source: the transaction datetime.
@@ -2671,7 +2773,11 @@ class ProjectEscrow(gl.Contract):
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
                 )
-        elif kind in ("SETTLEMENT_CLIENT", "UNMATCHED_SWEEP"):
+        elif kind in (
+            "SETTLEMENT_CLIENT",
+            "UNMATCHED_SWEEP",
+            "DEPOSIT_REFUND",
+        ):
             if gl.message.sender_address != self.client:
                 raise gl.vm.UserError(
                     "only the client can redirect this outflow"
@@ -2757,6 +2863,7 @@ class ProjectEscrow(gl.Contract):
         # Only this one outflow can be in flight, so inflight_out == amount.
         expected_after = u256(
             int(self.locked)
+            + int(self.deposit_credit_held)
             + int(self.appeal_credit_held)
             + int(self.appeal_bond_held)
             + int(self.queued_out)
@@ -2942,6 +3049,21 @@ class ProjectEscrow(gl.Contract):
                     self.client, "SETTLED", milestone_index, amount
                 )
 
+        elif kind == "DEPOSIT_REFUND":
+            self.outflow_statuses[outflow_id] = "CONFIRMED"
+
+            self.inflight_out = u256(
+                self.inflight_out - amount
+            )
+            self.sent_total = u256(
+                self.sent_total + amount
+            )
+            # Unused deposit returned to the client is not a principal
+            # refund: no milestone was ever funded with it.
+            self.total_deposits_refunded = u256(
+                self.total_deposits_refunded + amount
+            )
+
         elif kind == "APPEAL_CREDIT_REFUND":
             self.outflow_statuses[outflow_id] = "CONFIRMED"
 
@@ -3025,6 +3147,11 @@ class ProjectEscrow(gl.Contract):
         if self.appeal_bond_held != u256(0):
             raise gl.vm.UserError(
                 "settlement requires the appeal bond to be resolved"
+            )
+
+        if self.deposit_credit_held != u256(0):
+            raise gl.vm.UserError(
+                "settlement requires the deposit credit to be resolved"
             )
 
         index = 0
@@ -3234,6 +3361,7 @@ class ProjectEscrow(gl.Contract):
             or self.bounced_held != u256(0)
             or self.appeal_bond_held != u256(0)
             or self.appeal_credit_held != u256(0)
+            or self.deposit_credit_held != u256(0)
         ):
             raise gl.vm.UserError(
                 "project still has unsettled obligations"
@@ -3303,6 +3431,7 @@ class ProjectEscrow(gl.Contract):
             "worker": self.worker.as_hex,
             "project_status": self.project_status,
             "milestone_count": str(len(self.milestone_statuses)),
+            "total_required": str(int(self.total_required)),
             "total_funded": str(int(self.total_funded)),
             "total_released": str(int(self.total_released)),
             "total_refunded": str(int(self.total_refunded)),
@@ -3369,6 +3498,9 @@ class ProjectEscrow(gl.Contract):
                 int(self.total_appeal_bonds_received)
             ),
             "appeal_bond_held": str(int(self.appeal_bond_held)),
+            "deposit_credit_held": str(int(self.deposit_credit_held)),
+            "deposits_received": str(int(self.total_deposits_received)),
+            "deposits_refunded": str(int(self.total_deposits_refunded)),
             "appeal_credit_held": str(int(self.appeal_credit_held)),
             "unmatched_swept": str(int(self.total_unmatched_swept)),
             "settled_worker": str(int(self.total_settled_worker)),
@@ -3552,6 +3684,18 @@ class ProjectEscrow(gl.Contract):
     @gl.public.view
     def get_total_settled_client(self) -> str:
         return str(int(self.total_settled_client))
+
+    @gl.public.view
+    def get_deposit_credit_held(self) -> str:
+        return str(int(self.deposit_credit_held))
+
+    @gl.public.view
+    def get_total_deposits_received(self) -> str:
+        return str(int(self.total_deposits_received))
+
+    @gl.public.view
+    def get_total_deposits_refunded(self) -> str:
+        return str(int(self.total_deposits_refunded))
 
     @gl.public.view
     def get_appeal_credit_held(self) -> str:

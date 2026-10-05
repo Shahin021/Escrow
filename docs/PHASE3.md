@@ -1,5 +1,14 @@
 # Phase 3 — fairness and dispute mechanics
 
+> **Freeze reopened (Phase 6 preparation).** The pre-deployment review found
+> that `fund()` was payable and reverted on three caller-trippable
+> conditions, which probe L9 shows would strand the deposit outside the
+> ledger and, because `confirm_outflow` compares the balance against the
+> ledger, would block every later confirmation. Funding is now a check-free
+> payable deposit plus a non-payable `activate_funding()`. The state machine
+> and threat model below are updated accordingly; the rest of Phase 3 is
+> unchanged.
+
 Phase 3 adds deadlines, a review-stall path, an evidence-unavailable grace,
 a bonded worker appeal, refunds, finalization of rejected milestones, and
 two-party settlement. It changes no Phase 1 payment primitive and no Phase 2
@@ -99,8 +108,8 @@ Native balance is never the ledger. The identity, checked in every
 value-bearing test:
 
 ```
-funded + appeal_credit_received + unmatched_returns
-  == locked + appeal_credit_held + appeal_bond_held
+deposits_received + appeal_credit_received + unmatched_returns
+  == deposit_credit_held + locked + appeal_credit_held + appeal_bond_held
    + queued_out + inflight_out + bounced_held + unmatched_held
    + sent_total
 ```
@@ -113,6 +122,7 @@ principal returned to the client and nothing else.
 
 Outflow kinds, all through one serialized engine with at most one in flight:
 `MILESTONE_PAYOUT`, `MILESTONE_REFUND`, `PROJECT_REMAINDER_REFUND`,
+`DEPOSIT_REFUND`,
 `APPEAL_BOND_RETURN`, `APPEAL_BOND_FORFEIT`, `APPEAL_CREDIT_REFUND`,
 `SETTLEMENT_WORKER`, `SETTLEMENT_CLIENT`, `UNMATCHED_SWEEP`.
 
@@ -163,6 +173,7 @@ sweepable after `CLOSED`, and sweeping never changes the project status.
 | Client finalizes before the worker can appeal | Finalization waits for the appeal window | — |
 | Stranger calls timeout or sweep functions | Deterministic, fixed recipients, no caller-controlled value | — |
 | Stranger pays value in to jam the contract | Recorded as unmatched; neither closing nor confirmation depends on it | The payer loses that value to the client |
+| Client deposits the wrong amount, or deposits twice | `fund()` is payable and check-free: the value is credited to `deposit_credit_held` or, once funding is settled, to `unmatched_held`. Activation is a separate non-payable call that only accepts the exact amount, and unused credit is withdrawable through the outflow engine | A deposit from a third party goes to the client on sweep, since ownership cannot be verified |
 | Replayed or swapped settlement acceptance | Nonce moves on every change; counterparty-only | — |
 | Double claim of any value | Status guards plus exactly-once confirmation | — |
 | Prompt injection in evidence | Phase 2 trust boundary unchanged; appeal notes never enter the prompt | Model behaviour is not a contract guarantee |

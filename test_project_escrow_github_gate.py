@@ -156,6 +156,9 @@ def _submit(direct_vm, escrow, direct_owner, direct_alice, url=URL_A):
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, AMOUNT)
 
     direct_vm.sender = direct_alice

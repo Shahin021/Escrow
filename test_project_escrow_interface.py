@@ -105,11 +105,15 @@ def _fund(direct_vm, escrow, direct_owner):
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, TOTAL)
 
 
 PARTIES_KEYS = {
     "interface_id",
+    "total_required",
     "client",
     "worker",
     "project_status",

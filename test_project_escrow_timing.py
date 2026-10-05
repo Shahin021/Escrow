@@ -98,6 +98,8 @@ def _fund(direct_vm, escrow, direct_owner, total=1000):
     finally:
         direct_vm.value = 0
 
+    escrow.activate_funding()
+
 
 def _expect_revert(message, fn):
     with pytest.raises(Exception) as err:

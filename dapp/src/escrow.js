@@ -29,6 +29,8 @@ export async function readProject(client, address) {
     totalReleased: summary.total_released,
     totalRefunded: summary.total_refunded,
     locked: accounting.locked,
+    depositCreditHeld: accounting.deposit_credit_held,
+    totalRequired: summary.total_required,
     queuedOut: accounting.queued_out,
     inflightOut: accounting.inflight_out,
     bouncedHeld: accounting.bounced_held,

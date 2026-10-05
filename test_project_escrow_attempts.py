@@ -71,6 +71,9 @@ def _fund(direct_vm, escrow, direct_owner):
         direct_vm.value = 0
 
 
+    escrow.activate_funding()
+
+
 def test_first_submission_creates_pinned_attempt_reference(
     direct_vm,
     direct_deploy,

@@ -67,6 +67,9 @@ def _fund(
         direct_vm.value = 0
 
 
+    escrow.activate_funding()
+
+
 def _mock_unavailable(direct_vm):
     direct_vm.mock_web(
         r".*raw\.githubusercontent\.com.*",

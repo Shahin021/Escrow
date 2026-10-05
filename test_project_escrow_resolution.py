@@ -84,6 +84,9 @@ def _fund(direct_vm, escrow, client):
         direct_vm.value = 0
 
 
+    escrow.activate_funding()
+
+
 def _prepare(
     direct_vm,
     direct_deploy,

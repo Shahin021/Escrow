@@ -134,6 +134,9 @@ def _reject_to_final(
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, amount)
 
     direct_vm.sender = direct_alice
@@ -280,6 +283,9 @@ def test_cannot_appeal_before_final_rejection(
         escrow.fund()
     finally:
         direct_vm.value = 0
+
+
+    escrow.activate_funding()
 
     direct_vm.sender = direct_alice
     escrow.submit_deliverable(0, URL_A, "")
