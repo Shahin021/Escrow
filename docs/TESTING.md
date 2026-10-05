@@ -56,6 +56,11 @@ forward to later commits.
 | Windows | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp, `npm audit` 0 vulnerabilities, build OK on Node v24.18.0 | included in the suite | 2026-10-05 |
 
 | Windows | `ae9bafe` (Phase 6 prep) | 83 / 83 dApp, `npm audit` 0 vulnerabilities, build OK | included in the suite | 2026-10-05 |
+| Windows | `d053eef` (Phase 6 prep) | 499 / 499 Python | included in the suite | 2026-10-05 |
+| Linux | Phase 6 review head | 503 / 503 Python, 83 / 83 dApp, `npm audit` 0, build OK | included in the suite | 2026-10-05 |
+
+The Python total includes `test_deployment_rehearsal.py`, which runs the full
+runbook in glsim rather than Direct Mode, and `test_deployment_prereqs.py`.
 
 The newest rows cover `b85f002` and `ae9bafe`, the branch that reopens the Phase 3 freeze
 with the funding split, interface v2 and the documentation sweep. Both
