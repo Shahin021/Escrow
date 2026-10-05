@@ -45,6 +45,11 @@ differ it disables all writes and says so, rather than sending calls built
 for a different interface. This is why the id was bumped when funding
 changed: a consumer must be able to detect the incompatibility.
 
+The check **fails closed**. Until the contract has actually been read and has
+reported the expected id, the interface counts as unconfirmed and writes stay
+disabled, so a refresh that never ran or that failed cannot leave the app
+dispatching calls against an interface it has not verified.
+
 ## Funding is a three-step flow
 
 The contract's funding is deliberately split, because a payable method that

@@ -52,8 +52,8 @@ forward to later commits.
 | Linux | `d9526e9` (Phase 3 freeze) | 416 / 416 passed | 9 / 9 passed | 2026-10-03 |
 | Windows | `d9526e9` (Phase 3 freeze) | 416 / 416 passed, 0 failed, 0 skipped, in 13.00s | included in the suite | 2026-10-03 |
 | Windows | `10abdf5` (Phase 4) | 482 / 482 passed, in 32.63s | included in the suite | 2026-10-03 |
-| Linux | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp | included in the suite | 2026-10-04 |
-| Windows | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp, `npm audit` 0 vulnerabilities, build OK on Node v24.18.0 | included in the suite | 2026-10-04 |
+| Linux | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp | included in the suite | 2026-10-05 |
+| Windows | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp, `npm audit` 0 vulnerabilities, build OK on Node v24.18.0 | included in the suite | 2026-10-05 |
 
 The newest rows cover `b85f002`, the branch that reopens the Phase 3 freeze
 with the funding split, interface v2 and the documentation sweep. Both

@@ -898,4 +898,29 @@ describe("interface version is enforced, not just displayed", () => {
     expect(controller.interfaceWarning).toBeNull();
     expect(controller.writesEnabled).toBe(true);
   });
+
+  it("refuses to dispatch before the contract has been read", async () => {
+    const client = fakeClient(chainState());
+    const controller = createController({ config, networkInfo });
+
+    // Wallet connected and on the right chain, but no refresh has run, so
+    // the interface is unconfirmed.
+    controller.setWallet({ client, account: WORKER, chainId: 4221 });
+
+    expect(controller.interfaceSupported).toBe(false);
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.interfaceWarning).toMatch(/not been read yet/i);
+
+    await expect(
+      controller.dispatch("resolve", { milestoneIndex: 0 }),
+    ).rejects.toThrow(/interface is unconfirmed|not been read yet/i);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+
+    // Once the contract is read and reports the expected id, writes open.
+    await controller.refresh(client, NOW);
+
+    expect(controller.interfaceSupported).toBe(true);
+    expect(controller.writesEnabled).toBe(true);
+  });
 });

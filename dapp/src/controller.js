@@ -73,15 +73,25 @@ export function createController({ config, networkInfo }) {
     },
 
     get interfaceSupported() {
-      // Unknown until a project has been read; only a mismatch blocks writes.
+      // Fail closed: an unread contract is not a supported one. Writes stay
+      // disabled until the contract has actually reported the expected id,
+      // so a refresh that never ran or failed cannot leave the app sending
+      // calls built for an interface it has not confirmed.
       return (
-        !state.project ||
+        Boolean(state.project) &&
         state.project.interfaceId === EXPECTED_INTERFACE_ID
       );
     },
 
     get interfaceWarning() {
       if (api.interfaceSupported) return null;
+
+      if (!state.project) {
+        return (
+          "The contract has not been read yet, so its interface is " +
+          "unconfirmed and actions are disabled."
+        );
+      }
 
       return (
         `This contract reports interface ${state.project.interfaceId}, but ` +
@@ -213,11 +223,19 @@ export function createController({ config, networkInfo }) {
 
     async dispatch(action, { milestoneIndex = 0, input = {}, outflowId } = {}) {
       if (!api.writesEnabled) {
+        // Most specific cause first, so the message names the thing the user
+        // can actually act on.
+        if (!config.ok) {
+          throw new Error(
+            "Writes are disabled: no deployed escrow is configured.",
+          );
+        }
+
         throw new Error(
-          api.interfaceWarning ||
-            api.reconnectWarning ||
+          api.reconnectWarning ||
             api.networkWarning ||
-            "Writes are disabled: connect a wallet and configure a deployed escrow.",
+            api.interfaceWarning ||
+            "Writes are disabled: connect a wallet.",
         );
       }
 
