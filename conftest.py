@@ -13,6 +13,8 @@ v0.2.12 is the bundle that contains the runner referenced by the contract
 header `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`.
 """
 
+import os
+
 import pytest
 
 import windows_stdin_compat
@@ -39,7 +41,16 @@ def pytest_sessionfinish(session, exitstatus):
 
 # Single source of truth for the GenVM release used by Direct Mode tests.
 # CI keys its cache on this value (see .github/workflows/direct-mode-tests.yml).
-GENVM_VERSION = "v0.2.12"
+#
+# GENVM_VERSION_OVERRIDE runs the suite against another release tag without
+# moving this pin. It exists to verify compatibility with the version a
+# network reports, for example:
+#
+#     GENVM_VERSION_OVERRIDE=v0.2.11 python -m pytest -q
+#
+# The default is unchanged, so an override is always a deliberate, visible act
+# rather than a quiet reinterpretation of what the pin means.
+GENVM_VERSION = os.environ.get("GENVM_VERSION_OVERRIDE", "v0.2.12")
 
 
 @pytest.fixture

@@ -161,7 +161,11 @@ def test_registry_ownership_is_set_at_deployment_and_has_no_transfer(
 def test_the_pinned_runtime_matches_the_documented_one():
     """Keeps the runbook's GenVM pin and conftest from drifting apart."""
     conftest = open("conftest.py", encoding="utf-8").read()
-    pinned = re.search(r'GENVM_VERSION = "([^"]+)"', conftest).group(1)
+    # The pin is the default of the override, so read that default rather
+    # than assuming a bare literal.
+    pinned = re.search(
+        r'GENVM_VERSION_OVERRIDE",\s*"([^"]+)"', conftest
+    ).group(1)
 
     runbook = open("docs/PHASE6.md", encoding="utf-8").read()
 

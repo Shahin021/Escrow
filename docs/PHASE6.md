@@ -105,41 +105,81 @@ The accounting identity is asserted after every value-bearing step.
 no validator consensus, no real timing, no finality, and no gas. Nothing here
 substitutes for a Bradbury run.
 
-## Open risk: the runtime that executes this code is not the one tested
+## Runtime compatibility with Bradbury's GenVM v0.2.11
 
-The suite pins GenVM `v0.2.12` (`conftest.py`, `GENVM_VERSION`). The L9
-probes on 2026-09-29 recorded Bradbury executing
-`v0.2.11-x86_64-linux-release` (probes/RESULTS.md).
+The registry deployment trace
+(`0xb412556b5b0ba5c9710fba57e651481508fdd0a2360136803cfe07d88bbdff19`,
+registry at `0x33c5A0F51Ed10Ee21dC55399ce4A37D525321f99`) reports GenVM
+`v0.2.11-x86_64-linux-release`, while the suite pins `v0.2.12`. That was
+investigated rather than assumed away, and the pin was not moved.
 
-**Bradbury's current GenVM version is unknown.** The only evidence available
-is those traces from 2026-09-29, and a version observed then is not evidence
-of the version running now. The environment preparing this branch cannot
-reach `rpc-bradbury.genlayer.com` (the egress proxy answers 403), so no fresh
-observation can be made here, and the runtime cannot be reproduced locally
-either: the pinned bundle is the only one the harness installs.
+### Evidence
 
-So two things are true and neither should be overstated: every test to date
-ran on `v0.2.12`, and the version that will execute a deployed contract has
-not been established. It must be read from the first deployment's trace and
-compared before the live scenario is trusted. A regression test keeps this
-document and the pin in sync.
+**The two releases ship the same artifact.** `gltest` fetches
+`https://github.com/genlayerlabs/genvm/releases/download/<tag>/genvm-universal.tar.xz`.
+Both tags were downloaded here:
+
+| Tag | Release asset id | sha256 |
+| --- | --- | --- |
+| `v0.2.11` | `518ad3f4-8692-43a9-bbc8-9bbb61031cf6` | `4f0b358e…d93e2` |
+| `v0.2.12` | `0bb3dfbf-cb28-424e-9f70-463e1599b661` | `4f0b358e…d93e2` |
+
+Different asset ids, so these are two separate uploads, and an identical
+SHA-256, which is also the value CI pins as `GENVM_SHA256`. The bundle the
+suite has always tested against is byte-for-byte the bundle published under
+the tag Bradbury reports.
+
+**The contract's runner hash exists in both.** `project_escrow.py` pins its
+runner by content hash,
+`py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`, and both
+extractions provide exactly that hash, plus the same standard library
+`11rhn002yfajawsz7fai6mykznbxkxs6l91iskj5cm82c92qhy3v`. Because the
+dependency is content-addressed, the SDK executing the contract is the same
+code regardless of which tag delivered it. The only differences between the
+two extracted trees are locally generated `__pycache__/*.pyc` files.
+
+**The suite runs green on v0.2.11.** `conftest.py` gained
+`GENVM_VERSION_OVERRIDE`, which selects another release tag without moving
+the pin:
+
+```
+GENVM_VERSION_OVERRIDE=v0.2.11 python -m pytest -q    503 passed
+python -m pytest -q                                   503 passed
+```
+
+### What this does and does not establish
+
+Established: the SDK and runner this code depends on are identical under both
+tags, and the entire suite passes against the artifact published as v0.2.11.
+
+**Not established:** that the `genvm` binary running on Bradbury's validators
+is built from that artifact. The version string comes from the node's own
+executable; the release bundle supplies runners and the standard library, not
+the host VM. A behavioural difference in the host VM would not be caught by
+anything above.
+
+Also unestablished: whether Bradbury is still on v0.2.11 today. The trace is
+evidence for the moment that transaction executed, nothing more.
 
 ## Remaining before deployment
 
 1. ~~Local rehearsal~~ — done, see above.
 2. ~~Re-freeze Phase 3~~ — done, on simulated evidence; see the freeze status.
-3. Establish Bradbury's current GenVM version. This cannot be done from the
-   environment preparing this branch.
-4. Deployment and the live scenario, on explicit approval, which is the only
-   remaining gate.
+3. ~~Establish the runtime relationship~~ — done: the v0.2.11 and v0.2.12
+   bundles are byte-identical and the suite passes on both. The residual
+   unknown is the validators' host binary, which cannot be checked from here.
+4. Deployment of the escrow and the live scenario, on explicit approval,
+   which is the only remaining gate.
 
 ## Delta record (to be completed after deployment)
 
 | Item | Value |
 | --- | --- |
-| Source commit deployed | not deployed |
-| Registry address | not deployed |
+| Source commit deployed | registry only, from this branch |
+| Registry address | `0x33c5A0F51Ed10Ee21dC55399ce4A37D525321f99` (deployed) |
+| Registry deployment transaction | `0xb412556b5b0ba5c9710fba57e651481508fdd0a2360136803cfe07d88bbdff19` |
+| GenVM reported by that trace | `v0.2.11-x86_64-linux-release` |
 | Escrow address | not deployed |
 | Deployment transaction hashes | not deployed |
-| GenVM version observed | not deployed |
+| Escrow registered in the registry | not yet |
 | Differences between deployed and source | not deployed |
