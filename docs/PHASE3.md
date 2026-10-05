@@ -1,6 +1,7 @@
 # Phase 3 — fairness and dispute mechanics
 
-> **Freeze reopened (Phase 6 preparation).** The pre-deployment review found
+> **Freeze reopened (Phase 6 preparation); see `docs/PHASE6.md` for the
+> current freeze status and what must happen before a re-freeze.** The pre-deployment review found
 > that `fund()` was payable and reverted on three caller-trippable
 > conditions, which probe L9 shows would strand the deposit outside the
 > ledger and, because `confirm_outflow` compares the balance against the

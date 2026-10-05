@@ -55,7 +55,9 @@ forward to later commits.
 | Linux | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp | included in the suite | 2026-10-05 |
 | Windows | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp, `npm audit` 0 vulnerabilities, build OK on Node v24.18.0 | included in the suite | 2026-10-05 |
 
-The newest rows cover `b85f002`, the branch that reopens the Phase 3 freeze
+| Windows | `ae9bafe` (Phase 6 prep) | 83 / 83 dApp, `npm audit` 0 vulnerabilities, build OK | included in the suite | 2026-10-05 |
+
+The newest rows cover `b85f002` and `ae9bafe`, the branch that reopens the Phase 3 freeze
 with the funding split, interface v2 and the documentation sweep. Both
 platforms ran the Python suite and the dApp suite; the Windows run used
 `.\.venv\Scripts\python.exe -m pytest -q` and `npm test`.
