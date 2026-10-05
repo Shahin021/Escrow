@@ -67,7 +67,7 @@ function fakeClient(scenario) {
     readContract: vi.fn(async ({ functionName, args }) => {
       if (functionName === "parties") {
         return {
-          interface_id: "genlayer.milestone-escrow.v2",
+          interface_id: scenario.interface_id || "genlayer.milestone-escrow.v2",
           client: CLIENT,
           worker: WORKER,
           project_status: scenario.status,
@@ -870,5 +870,32 @@ describe("the three-step funding flow", () => {
     expect(actions).not.toContain("fund");
     expect(actions).not.toContain("activate_funding");
     expect(actions).not.toContain("withdraw_deposit_credit");
+  });
+});
+
+describe("interface version is enforced, not just displayed", () => {
+  it("refuses to drive a contract reporting another interface", async () => {
+    const { controller, client } = await loaded(
+      chainState({ interface_id: "genlayer.milestone-escrow.v1" }),
+      { account: WORKER },
+    );
+
+    expect(controller.interfaceSupported).toBe(false);
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.interfaceWarning).toMatch(/v1.*v2/s);
+
+    await expect(
+      controller.dispatch("resolve", { milestoneIndex: 0 }),
+    ).rejects.toThrow(/interface/i);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("allows writes on the expected interface", async () => {
+    const { controller } = await loaded(chainState(), { account: WORKER });
+
+    expect(controller.interfaceSupported).toBe(true);
+    expect(controller.interfaceWarning).toBeNull();
+    expect(controller.writesEnabled).toBe(true);
   });
 });

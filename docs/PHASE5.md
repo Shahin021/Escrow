@@ -37,6 +37,14 @@ a malformed one, the app shows a "not configured" banner and **writes are
 disabled**; reading is still allowed. Addresses and RPC endpoints are public
 values, not secrets, and nothing secret is read by the frontend or committed.
 
+## The interface version is enforced
+
+The app is written against `genlayer.milestone-escrow.v2`. On every load it
+compares that with the `interface_id` the contract reports, and if they
+differ it disables all writes and says so, rather than sending calls built
+for a different interface. This is why the id was bumped when funding
+changed: a consumer must be able to detect the incompatibility.
+
 ## Funding is a three-step flow
 
 The contract's funding is deliberately split, because a payable method that

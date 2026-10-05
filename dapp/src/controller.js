@@ -16,6 +16,7 @@ import { readMilestone, readOutflows, readProject, sendAction } from "./escrow.j
 import { buildCall } from "./methods.js";
 import { milestonePredicates, outflowActions, projectPredicates } from "./predicates.js";
 import { describeMismatch, networkMatches } from "./network.js";
+import { EXPECTED_INTERFACE_ID } from "./config.js";
 import { TX_IDLE } from "./tx.js";
 
 export function createController({ config, networkInfo }) {
@@ -71,12 +72,32 @@ export function createController({ config, networkInfo }) {
       return networkMatches(state.chainId, networkInfo.chainId);
     },
 
+    get interfaceSupported() {
+      // Unknown until a project has been read; only a mismatch blocks writes.
+      return (
+        !state.project ||
+        state.project.interfaceId === EXPECTED_INTERFACE_ID
+      );
+    },
+
+    get interfaceWarning() {
+      if (api.interfaceSupported) return null;
+
+      return (
+        `This contract reports interface ${state.project.interfaceId}, but ` +
+        `this app is built for ${EXPECTED_INTERFACE_ID}. Actions are ` +
+        "disabled because the calls would not match."
+      );
+    },
+
     get writesEnabled() {
-      return writesEnabled({
-        configOk: config.ok,
-        connected: Boolean(state.account && state.client),
-        correctNetwork: api.correctNetwork,
-      });
+      return (
+        writesEnabled({
+          configOk: config.ok,
+          connected: Boolean(state.account && state.client),
+          correctNetwork: api.correctNetwork,
+        }) && api.interfaceSupported
+      );
     },
 
     get reconnectWarning() {
@@ -193,7 +214,8 @@ export function createController({ config, networkInfo }) {
     async dispatch(action, { milestoneIndex = 0, input = {}, outflowId } = {}) {
       if (!api.writesEnabled) {
         throw new Error(
-          api.reconnectWarning ||
+          api.interfaceWarning ||
+            api.reconnectWarning ||
             api.networkWarning ||
             "Writes are disabled: connect a wallet and configure a deployed escrow.",
         );

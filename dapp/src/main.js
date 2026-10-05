@@ -77,7 +77,10 @@ function renderWallet() {
 
   setText(
     el("network-warning"),
-    controller.reconnectWarning || controller.networkWarning || "",
+    controller.interfaceWarning ||
+      controller.reconnectWarning ||
+      controller.networkWarning ||
+      "",
   );
 }
 
