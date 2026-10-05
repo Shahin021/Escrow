@@ -50,7 +50,8 @@ deadline is allowed.
 
 ```
 LOCKED
-  -> AWAITING_DELIVERY            (funding, or the previous milestone settling)
+  -> AWAITING_DELIVERY            (activate_funding, or the previous
+                                   milestone settling)
 AWAITING_DELIVERY
   -> UNDER_REVIEW                 submit_deliverable
   -> REFUND_PENDING               expire_delivery (now >= delivery deadline)
@@ -78,7 +79,26 @@ any non-terminal -> CANCELLED                  settlement, or a stop-refund
 ```
 
 Terminal: `RELEASED`, `REFUNDED`, `CANCELLED`. Project:
-`AWAITING_DEPOSIT -> ACTIVE -> SETTLING -> CLOSED`.
+`AWAITING_DEPOSIT -> ACTIVE -> SETTLING -> CLOSED`. The move from
+`AWAITING_DEPOSIT` to `ACTIVE` is made by `activate_funding()`, not by the
+deposit itself; see below.
+
+## Funding
+
+Funding is deliberately two calls plus a way out, because a payable method
+that rejects a wrong amount would keep the value (probe L9) while rolling
+back the accounting that would have recorded it.
+
+| Call | Payable | What it does |
+| --- | --- | --- |
+| `fund()` | yes | Accepts any value with no caller-trippable check. From the client while `AWAITING_DEPOSIT` it adds to `deposit_credit_held`; from anyone else, or after funding is settled, it adds to `unmatched_held`. The only revert is a zero-value call, which has nothing to strand. |
+| `activate_funding()` | no | Client-only, `AWAITING_DEPOSIT` only, and only when `deposit_credit_held` equals `total_required` exactly. Moves the credit into `locked` atomically, sets the project `ACTIVE` and activates milestone 0. Being non-payable, it may reject freely. |
+| `withdraw_deposit_credit(amount)` | no | Client-only. Returns unused or mistaken deposit credit through the serialized outflow engine as `DEPOSIT_REFUND`, redirectable only by the client if it bounces, and counted in `total_deposits_refunded` rather than `total_refunded`. |
+
+So a mistyped deposit is never lost: it is credited, and the client either
+tops it up to the exact amount or withdraws it. `deposit_credit_held` is part
+of the balance `confirm_outflow` expects, blocks `close_project`, and blocks
+settlement, since it is the client's money and not splittable principal.
 
 ## Appeal economics
 

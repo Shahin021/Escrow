@@ -74,7 +74,8 @@ The action list is computed from the connected account's role and the current
 project and milestone state, mirroring the contract's own guards so no button
 is offered that the contract would reject:
 
-* client: fund, propose or accept settlement, withdraw their own proposal
+* client: deposit, activate funding, withdraw deposit credit, propose or
+  accept settlement, withdraw their own proposal
 * worker: submit and replace evidence, claim payment, appeal, abort a failed
   appeal, add and withdraw appeal credit, settlement actions
 * anyone: resolve, mark a review stalled, expire a delivery, finalize a
