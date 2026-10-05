@@ -35,7 +35,7 @@ Submit
 Privacy policy
 """
 
-INTERFACE_ID = "genlayer.milestone-escrow.v1"
+INTERFACE_ID = "genlayer.milestone-escrow.v2"
 
 T0 = "2026-09-21T09:33:00Z"
 

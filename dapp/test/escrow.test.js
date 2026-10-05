@@ -10,7 +10,7 @@ function fakeClient(receipt) {
     readContract: vi.fn(async ({ functionName }) => {
       if (functionName === "parties") {
         return {
-          interface_id: "genlayer.milestone-escrow.v1",
+          interface_id: "genlayer.milestone-escrow.v2",
           client: "0x" + "c1".repeat(20),
           worker: "0x" + "a1".repeat(20),
           project_status: "ACTIVE",

@@ -95,7 +95,13 @@ MAX_DELIVERY_WINDOW_SECONDS = 365 * SECONDS_PER_DAY
 # Stable identifier for the read interface other contracts and tools code
 # against. Any change to the shape of the interface views below requires a new
 # id, never a silent redefinition of this one.
-ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v1"
+#
+# v2 (Phase 6 preparation): funding split into a payable fund() plus a
+# non-payable activate_funding(), withdraw_deposit_credit() added, parties()
+# gained total_required, and get_accounting() gained deposit_credit_held,
+# deposits_received and deposits_refunded. A v1 consumer would misread the
+# funding flow entirely, so the id moves rather than being redefined.
+ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v2"
 
 # Optional GitHub check gate. The check is always resolved against the exact
 # commit the evidence is pinned to, never against a branch or a later commit.
