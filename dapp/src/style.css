@@ -1,0 +1,9 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; padding: 1.5rem; max-width: 60rem; }
+.banner { padding: .75rem; border-radius: .5rem; background: #fde68a; color: #1f2937; }
+.banner:empty { display: none; }
+button { padding: .5rem .9rem; margin: .2rem .3rem .2rem 0; }
+button[disabled] { opacity: .5; cursor: not-allowed; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8884; }
+code { word-break: break-all; }

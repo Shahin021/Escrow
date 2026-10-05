@@ -1,0 +1,54 @@
+name: dApp build (Pages)
+
+# Build and verification only. Publishing is deliberately NOT enabled yet:
+# there is no confirmed escrow deployment, so a published site would imply a
+# live app that does not exist. The deploy job below is ready but gated behind
+# a manual run and an environment that has to be configured first.
+on:
+  push:
+    paths:
+      - "dapp/**"
+      - ".github/workflows/dapp-pages.yml"
+  pull_request:
+    paths:
+      - "dapp/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dapp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Vitest 5 requires Node ^22.12 || ^24 || >=26.
+          node-version: "22"
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        # Addresses are build-time configuration, never secrets. With none
+        # set, the app builds in its "not configured" read-only state.
+        env:
+          VITE_GENLAYER_NETWORK: ${{ vars.GENLAYER_NETWORK }}
+          VITE_ESCROW_ADDRESS: ${{ vars.ESCROW_ADDRESS }}
+          VITE_REGISTRY_ADDRESS: ${{ vars.REGISTRY_ADDRESS }}
+        run: npm run build
+
+      - name: Upload build for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: dapp-dist
+          path: dapp/dist
