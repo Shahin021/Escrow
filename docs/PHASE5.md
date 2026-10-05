@@ -121,6 +121,26 @@ build as an artifact. **Publishing is deliberately not enabled**: with no
 confirmed deployment, a published site would imply a live app that does not
 exist.
 
+## Toolchain and advisories
+
+Pinned dev dependencies: **Vite 8.3.2** and **Vitest 5.0.3**. These are major
+upgrades from Vite 5 / Vitest 2, taken deliberately rather than deferred: on
+the previous pins `npm audit` reported five advisories, all in the dev server
+and test runner (esbuild dev-server request exposure, Vite `.map` path
+traversal, `server.fs.deny` bypass on Windows, launch-editor NTLM hash
+disclosure on Windows, and the Vitest UI / `@vitest/mocker` file-read issues).
+
+None of them affected the built site, and `npm audit --omit=dev` was already
+clean, but they do affect a developer running `npm run dev` or `npm test`
+locally, which is reason enough to move. The upgrade was trialled in a scratch
+copy first: all 74 tests passed and the production build succeeded before it
+was adopted here, so nothing was taken on faith and `npm audit fix --force`
+was never run.
+
+**Node requirement:** Vitest 5 needs Node `^22.12 || ^24 || >=26`, so
+`package.json` declares `engines.node >= 22.12.0` and the CI workflow uses
+Node 22. A Node 20 environment will no longer install this toolchain.
+
 ## Limitations
 
 * **Not verified against a live contract.** Every read and write path is

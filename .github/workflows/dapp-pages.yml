@@ -29,7 +29,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Vitest 5 requires Node ^22.12 || ^24 || >=26.
+          node-version: "22"
 
       - name: Install pinned dependencies
         run: npm ci
