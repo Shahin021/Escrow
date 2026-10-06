@@ -330,9 +330,150 @@ def test_the_sdk_sets_gas_to_the_estimate_verbatim():
         assert absent not in source
 
 
-def test_the_deploy_script_exposes_an_explicit_gas_limit():
-    """The script must allow an authoritative cap to be supplied, and must
-    not invent one."""
+ESTIMATE_HEX = "0x5d830df"  # 98,054,367, the estimate Bradbury returned
+
+
+class _FakeProvider:
+    """Answers the calls _prepare_transaction makes, and records sends."""
+
+    url = "https://rpc-bradbury.genlayer.com"
+
+    def __init__(self):
+        self.sent = []
+
+    def make_request(self, method, params=None):
+        if method == "eth_estimateGas":
+            return {"result": ESTIMATE_HEX}
+
+        if method == "eth_sendRawTransaction":
+            self.sent.append(params)
+
+            return {"result": "0x" + "ab" * 32}
+
+        return {"result": "0x1"}
+
+
+class _RecordingAccount:
+    """Stands at the signing boundary and records what it was asked to sign."""
+
+    address = "0x2a749c03a6DE888B7B42305b92032Fa9c1D54543"
+
+    def __init__(self):
+        self.signed = []
+
+    def sign_transaction(self, transaction):
+        self.signed.append(dict(transaction))
+
+        class _Signed:
+            raw_transaction = b"\xde\xad\xbe\xef"
+
+        return _Signed()
+
+
+def _deploy_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "deploy_escrow", os.path.join(REPO_ROOT, "scripts", "deploy_escrow.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+
+def _fake_client(monkeypatch):
+    from genlayer_py import create_client
+    from genlayer_py.chains import testnet_bradbury
+    from genlayer_py.contracts import actions
+
+    client = create_client(chain=testnet_bradbury)
+    client.provider = _FakeProvider()
+
+    # _prepare_transaction reads a nonce and a block; keep both offline.
+    monkeypatch.setattr(
+        type(client), "get_current_nonce", lambda self, address: 7, raising=False
+    )
+
+    import web3
+
+    real_w3 = web3.Web3()
+
+    class _Eth:
+        # The real contract factory is needed to encode addTransaction; only
+        # the network-touching calls are stubbed.
+        contract = real_w3.eth.contract
+
+        @staticmethod
+        def get_block(_):
+            return {"baseFeePerGas": 1_000_000_000}
+
+    class _W3:
+        eth = _Eth()
+
+        @staticmethod
+        def to_wei(value, unit):
+            return value * 10**9
+
+        @staticmethod
+        def to_bytes(hexstr=None):
+            return bytes.fromhex(hexstr[2:] if hexstr.startswith("0x") else hexstr)
+
+        @staticmethod
+        def to_hex(value):
+            return "0x" + value.hex()
+
+    client.w3 = _W3()
+    client.chain.consensus_main_contract = {
+        "address": "0x0112Bf6e83497965A5fdD6Dad1E447a6E004271D",
+        "abi": testnet_bradbury.consensus_main_contract["abi"],
+    }
+
+    return client
+
+
+def test_an_explicit_gas_limit_reaches_the_signing_boundary(monkeypatch):
+    """Fails if --gas-limit is accepted but ignored.
+
+    The override must replace the estimate in the transaction that is
+    actually signed, not merely be parsed.
+    """
+    deploy = _deploy_module()
+    client = _fake_client(monkeypatch)
+    account = _RecordingAccount()
+    code = open(os.path.join(REPO_ROOT, "contracts", "escrow_registry.py"), "rb").read()
+
+    transaction = deploy.prepare_deployment_transaction(
+        client, account, [], code, gas_limit=16_000_000
+    )
+
+    assert transaction["gas"] == hex(16_000_000)
+    assert transaction["gas"] != ESTIMATE_HEX, "the estimate must be replaced"
+
+    deploy.sign_deployment(account, transaction)
+
+    assert account.signed, "the transaction must reach the signing boundary"
+    assert account.signed[0]["gas"] == hex(16_000_000)
+
+
+def test_without_the_flag_the_estimate_is_used_unchanged(monkeypatch):
+    """The default path must stay exactly what the SDK would have produced."""
+    deploy = _deploy_module()
+    client = _fake_client(monkeypatch)
+    account = _RecordingAccount()
+    code = open(os.path.join(REPO_ROOT, "contracts", "escrow_registry.py"), "rb").read()
+
+    transaction = deploy.prepare_deployment_transaction(client, account, [], code)
+
+    assert transaction["gas"] == ESTIMATE_HEX
+
+    deploy.sign_deployment(account, transaction)
+
+    assert account.signed[0]["gas"] == ESTIMATE_HEX
+
+
+def test_no_gas_ceiling_is_invented():
+    """No guessed cap, and no claim that any value is authoritative."""
     source = open(
         os.path.join(REPO_ROOT, "scripts", "deploy_escrow.py"), encoding="utf-8"
     ).read()
@@ -340,8 +481,7 @@ def test_the_deploy_script_exposes_an_explicit_gas_limit():
     assert "--gas-limit" in source
     assert "default=None" in source
 
-    # No guessed ceiling is baked in.
-    for guess in ("16777216", "30000000", "0x1c9c380"):
+    for guess in ("16777216", "30000000", "0x1c9c380", "0xffffff"):
         assert guess not in source
 
 

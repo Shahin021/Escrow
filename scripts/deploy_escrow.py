@@ -169,6 +169,72 @@ def preflight(constructor_args, code_bytes):
         )
 
 
+def prepare_deployment_transaction(
+    client, sender_account, constructor_args, code_bytes, gas_limit=None
+):
+    """Build the deployment transaction, optionally overriding the gas limit.
+
+    genlayer-py 0.16.3 offers no hook for this: deploy_contract,
+    _send_transaction and _prepare_transaction all take no gas parameter, and
+    _prepare_transaction ends by setting transaction["gas"] to the
+    eth_estimateGas result verbatim. So the SDK's own steps are composed here
+    in order and the override is applied to the returned dict before signing.
+    Nothing in the SDK is monkey-patched and no global state is touched.
+
+    With gas_limit None the transaction is exactly what deploy_contract would
+    have produced.
+    """
+    from genlayer_py.abi import calldata
+    from genlayer_py.abi.transactions import serialize
+    from genlayer_py.contracts.actions import (
+        _encode_add_transaction_data,
+        _prepare_transaction,
+    )
+    from genlayer_py.contracts.utils import make_calldata_object
+    from web3.constants import ADDRESS_ZERO
+
+    payload = serialize(
+        [
+            code_bytes,
+            calldata.encode(
+                make_calldata_object(method=None, args=constructor_args)
+            ),
+            False,
+        ]
+    )
+
+    encoded = _encode_add_transaction_data(
+        self=client,
+        sender_account=sender_account,
+        recipient=ADDRESS_ZERO,
+        consensus_max_rotations=client.chain.default_consensus_max_rotations,
+        data=payload,
+    )
+
+    transaction = _prepare_transaction(
+        self=client,
+        sender=sender_account.address,
+        recipient=client.chain.consensus_main_contract["address"],
+        data=encoded,
+        value=0,
+    )
+
+    if gas_limit is not None:
+        # Replaces the estimate the SDK just wrote, before signing.
+        transaction["gas"] = hex(gas_limit)
+
+    return transaction
+
+
+def sign_deployment(account, transaction):
+    """The signing boundary: whatever gas is in this dict is what gets
+    signed and submitted."""
+    signed = account.sign_transaction(transaction)
+    raw = signed.raw_transaction
+
+    return raw.hex() if hasattr(raw, "hex") else raw
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--milestones", required=True)
@@ -253,22 +319,24 @@ def main():
 
     from genlayer_py import create_account, create_client
     from genlayer_py.chains import testnet_bradbury
-    from genlayer_py.types import TransactionStatus
 
     client = create_client(chain=testnet_bradbury, account=create_account(key))
+    client.initialize_consensus_smart_contract()
 
-    with open(CONTRACT, "r", encoding="utf-8") as handle:
-        code = handle.read().encode("utf-8")
-
-    tx = client.deploy_contract(code=code, args=constructor_args)
-
-    print(f"transaction {tx}")
-
-    receipt = client.wait_for_transaction_receipt(
-        transaction_hash=tx, status=TransactionStatus.FINALIZED
+    transaction = prepare_deployment_transaction(
+        client,
+        client.local_account,
+        constructor_args,
+        code_bytes,
+        gas_limit=args.gas_limit,
     )
 
-    print(json.dumps(receipt, indent=2, default=str)[:2000])
+    print(f"gas limit in the transaction: {transaction['gas']}")
+
+    signed = sign_deployment(client.local_account, transaction)
+    sent = client.provider.make_request("eth_sendRawTransaction", [signed])
+
+    print(json.dumps(sent, default=str)[:600])
 
 
 if __name__ == "__main__":

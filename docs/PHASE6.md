@@ -363,3 +363,18 @@ authoritative cap can be supplied once known. **No value is guessed**, the
 RPC error is not suppressed, and the script still warns, before any
 submission, that the SDK will otherwise use the estimate verbatim. The script
 remains dry run by default.
+
+The first version of that flag was parsed and then never applied, so it
+changed nothing. `deploy_contract`, `_send_transaction` and
+`_prepare_transaction` all take no gas parameter, so there is no hook to pass
+one through. The submit path therefore composes the SDK's own steps in order
+(`_encode_add_transaction_data`, `_prepare_transaction`, then sign and send)
+and applies the override to the transaction dict before signing. Nothing in
+the SDK is monkey-patched and no global state is touched. A test drives that
+path with a recording account and asserts the overridden value is what
+reaches the signing boundary; removing the override makes it fail.
+
+Supplying a gas limit does not make deployment possible. The estimate is
+about 98M, and a transaction given less gas than it needs runs out rather
+than becoming cheaper. The flag exists so an authoritative ceiling can be
+used once known; the ceiling is still unknown.
