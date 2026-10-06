@@ -305,3 +305,75 @@ def test_the_dry_run_reports_size_and_sends_nothing(tmp_path):
     assert "DRY RUN: nothing was sent." in result.stdout
     # The default path must never reach the network.
     assert "estimate" not in result.stdout.lower()
+
+
+# Gas-limit handling. genlayer-py 0.16.3 sets the transaction's gas to the
+# eth_estimateGas result verbatim (contracts/actions.py::_prepare_transaction
+# ends with transaction["gas"] = ...estimate...), with no buffer and no cap.
+# Bradbury accepted the estimate (0x5d830df) but rejected the submission with
+# -32602 'gas limit too high', so the submit-time ceiling is lower than the
+# estimate and is not applied by the SDK.
+
+def test_the_sdk_sets_gas_to_the_estimate_verbatim():
+    """Pins the SDK behaviour this diagnosis rests on."""
+    import inspect
+
+    from genlayer_py.contracts import actions
+
+    source = inspect.getsource(actions._prepare_transaction)
+
+    assert 'transaction["gas"] = self.provider.make_request(' in source
+    assert '"eth_estimateGas"' in source
+
+    # No buffer, multiplier or cap is applied to the estimate.
+    for absent in ("* 1.", "gas_cap", "min(", "max_gas"):
+        assert absent not in source
+
+
+def test_the_deploy_script_exposes_an_explicit_gas_limit():
+    """The script must allow an authoritative cap to be supplied, and must
+    not invent one."""
+    source = open(
+        os.path.join(REPO_ROOT, "scripts", "deploy_escrow.py"), encoding="utf-8"
+    ).read()
+
+    assert "--gas-limit" in source
+    assert "default=None" in source
+
+    # No guessed ceiling is baked in.
+    for guess in ("16777216", "30000000", "0x1c9c380"):
+        assert guess not in source
+
+
+def test_the_dry_run_warns_that_the_estimate_is_used_verbatim(tmp_path):
+    path = tmp_path / "milestones.json"
+    path.write_bytes(
+        json.dumps(
+            [{"spec": "Unfunded runtime smoke test", "amount": "1"}],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            os.path.join("scripts", "deploy_escrow.py"),
+            "--milestones",
+            str(path),
+            "--worker",
+            WORKER,
+            "--max-revisions",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0
+    assert "DRY RUN: nothing was sent." in result.stdout

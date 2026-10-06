@@ -184,6 +184,16 @@ def main():
         help="read-only: estimate gas for the exact payload and report the "
         "revert reason if it fails. Broadcasts nothing.",
     )
+    parser.add_argument(
+        "--gas-limit",
+        type=int,
+        default=None,
+        help="explicit gas limit for the deployment transaction. Without it "
+        "the SDK uses the eth_estimateGas result verbatim "
+        "(genlayer_py/contracts/actions.py::_prepare_transaction), which "
+        "Bradbury rejected with -32602 'gas limit too high'. No default is "
+        "guessed here: supply a value only if you have an authoritative cap.",
+    )
     parser.add_argument("--submit", action="store_true")
     args = parser.parse_args()
 
@@ -227,6 +237,13 @@ def main():
     if not key:
         print("\nGENLAYER_PRIVATE_KEY is not set; refusing to continue.")
         sys.exit(1)
+
+    if args.gas_limit is None:
+        print(
+            "\nNOTE: no --gas-limit given, so the SDK will set gas to the "
+            "eth_estimateGas result verbatim. That is what Bradbury "
+            "previously rejected with -32602 'gas limit too high'."
+        )
 
     print("\nThis WILL send a deployment transaction to", NETWORK)
 

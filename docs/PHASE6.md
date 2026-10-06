@@ -295,3 +295,71 @@ The separate `intrinsic gas too low` RPC error and `status: 0` receipt are a
 fee-estimation failure, independent of the argument corruption. It should be
 re-checked once a correctly encoded deployment is attempted, since a
 malformed payload can itself distort estimation.
+
+## Why `eth_sendRawTransaction` rejects the escrow after the estimate succeeds
+
+### Established from the installed SDK
+
+`genlayer_py/contracts/actions.py::_prepare_transaction` ends with:
+
+```python
+transaction["gas"] = self.provider.make_request(
+    "eth_estimateGas", params=[transaction]
+)["result"]
+return transaction
+```
+
+So the SDK sets the transaction's gas to the **estimate verbatim**: no
+buffer, no multiplier and no cap. `_send_transaction` then signs that
+transaction and submits it unchanged. The gas limit Bradbury rejected was
+therefore `0x5d830df` (98,054,367), chosen by the node's own estimator and
+passed straight through.
+
+### Measured, from the two estimates that reached JSON-RPC
+
+| Artifact | calldata | estimate | gas per calldata byte |
+| --- | --- | --- | --- |
+| `escrow_registry.py` (deployed successfully) | 9,637 | 8,292,038 | 860 |
+| compact `project_escrow.py` | 125,253 | 98,054,367 | 783 |
+
+Deployment cost scales with source size at roughly 800 gas per byte on this
+network.
+
+### What remains unknown
+
+The value of the submit-time ceiling. It is **lower than the estimate**
+(98,054,367) and **lower than the block gas limit** (`0x5f5e100`,
+100,000,000), because the node accepted the estimate and then refused the
+submission with `-32602 gas limit too high`. Its exact value is not
+derivable from anything reachable here:
+
+* the message does not appear in any public GenLayer repository reachable
+  from this environment (`genlayer-node` and `genlayer-consensus` are not
+  publicly readable; `genlayer-studio` and `genvm` are, and do not contain
+  it);
+* GitHub's code search API is rate-limited from this environment;
+* no read-only RPC call reveals a per-transaction gas cap. `eth_estimateGas`
+  does not apply it, which is precisely why the estimate succeeded.
+
+One hypothesis is consistent with every observation but is **not verified**:
+a per-transaction cap of 2²⁴ (16,777,216), the EIP-7825 shape. The registry
+deployed successfully at an estimate of 8.3M, below that; the escrow is
+refused at 98M, above it. Consistency is not proof, and no safe read-only
+test distinguishes it, since the cap is applied at submission.
+
+### What follows if a cap of that order is confirmed
+
+No change to `deploy_escrow.py` can help. A transaction given less gas than
+it needs does not become cheaper, it runs out. At ~800 gas per byte, fitting
+under 16.7M would mean a source of roughly 21 KB, against the current 125 KB
+compact artifact: that is an architectural change, splitting the contract or
+moving logic behind a library, not a tuning exercise. **No such change has
+been made**, and none should be until the ceiling is known.
+
+### Change made
+
+`scripts/deploy_escrow.py` gains `--gas-limit`, defaulting to `None`, so an
+authoritative cap can be supplied once known. **No value is guessed**, the
+RPC error is not suppressed, and the script still warns, before any
+submission, that the SDK will otherwise use the estimate verbatim. The script
+remains dry run by default.
