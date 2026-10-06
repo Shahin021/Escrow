@@ -30,7 +30,12 @@ Add --json to print the argument list in machine-readable form.
 
 import argparse
 import json
+import os
 import sys
+
+# Import the repository root, so the Windows stdin shim below is importable
+# when the script is run from anywhere.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 CONTRACT = "contracts/project_escrow.py"
 
@@ -210,6 +215,16 @@ def main():
         print("  SKIPPED: glsim is not installed in this environment.")
         return
 
+    # gltest's loader injects the message by writing a temp file, mapping it
+    # onto fd 0 and unlinking it immediately. Windows refuses to delete a file
+    # that is still open, which surfaces here as
+    # "[WinError 32] The process cannot access the file...". The test suite
+    # avoids it because conftest.py installs this shim; a standalone script
+    # has to install it too.
+    import windows_stdin_compat
+
+    windows_stdin_compat.install()
+
     engine = SimEngine(StateStore())
     engine.activate()
 
@@ -229,6 +244,11 @@ def main():
         fail(f"the constructor rejected these arguments: {error}")
     finally:
         engine.deactivate()
+
+        leftovers = windows_stdin_compat.finalize()
+
+        if leftovers:
+            print(f"  note: temp files left behind: {', '.join(leftovers)}")
 
     print("\nNothing was sent. To deploy, review scripts/deploy_escrow.py.")
 
