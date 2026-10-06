@@ -183,3 +183,47 @@ evidence for the moment that transaction executed, nothing more.
 | Deployment transaction hashes | not deployed |
 | Escrow registered in the registry | not yet |
 | Differences between deployed and source | not deployed |
+
+## Why the CLI corrupted `milestones_json`
+
+GenLayer CLI 0.39.2 cannot pass a JSON string as a string. Its argument
+parser does:
+
+```js
+function parseArg(value, previous = []) {
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === "object" || Array.isArray(parsed)) {
+      return [...previous, coerceValue(parsed)];   // the STRUCTURE, not the text
+    }
+  } catch {}
+  return [...previous, parseScalar(value)];
+}
+```
+
+So any argument that parses as an object or array is forwarded as that
+structure. The constructor expects `milestones_json: str` and received a list
+of dicts. `coerceValue` then runs `parseScalar` over every nested string, so
+`"amount": "1000"` would further become the number `1000`. The CLI's echo,
+`[{spec:Unfunded runtime smoke test,amount:1}]`, is that parsed structure
+printed back; it is a symptom, not the input.
+
+There is no escape: the parser has `addr#` and `b#` prefixes, but nothing to
+force a string, and the help text lists `array` and `dict` as supported
+argument types. A JSON array argument is therefore always converted.
+
+**Consequence:** the escrow cannot be deployed with `genlayer deploy --args`.
+Use `scripts/deploy_escrow.py`, which builds the arguments in Python where a
+`str` stays a `str`.
+
+### Tooling
+
+| Script | What it does |
+| --- | --- |
+| `scripts/prepare_deploy.py` | Validates the milestones file against the constructor's own rules, prints every decoded argument with its type, computes `total_required` and each appeal bond, then deploys into the local simulator to prove the constructor accepts exactly these arguments. Sends nothing. |
+| `scripts/deploy_escrow.py` | Same arguments, dry run by default. `--submit` additionally requires `GENLAYER_PRIVATE_KEY` and typing `deploy` at a prompt. |
+
+The separate `intrinsic gas too low` RPC error and `status: 0` receipt are a
+fee-estimation failure, independent of the argument corruption. It should be
+re-checked once a correctly encoded deployment is attempted, since a
+malformed payload can itself distort estimation.
