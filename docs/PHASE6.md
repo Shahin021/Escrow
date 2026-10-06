@@ -221,7 +221,7 @@ Use `scripts/deploy_escrow.py`, which builds the arguments in Python where a
 | Script | What it does |
 | --- | --- |
 | `scripts/prepare_deploy.py` | Reads the milestones file as `utf-8-sig`, so a UTF-8 BOM from PowerShell's `Set-Content -Encoding utf8` is handled rather than rejected. Validates it against the constructor's own rules, prints every decoded argument with its type, computes `total_required` and each appeal bond, then deploys into the local simulator to prove the constructor accepts exactly these arguments. Sends nothing. |
-| `scripts/diagnose_deploy.py` | Read-only diagnosis. It makes its JSON-RPC calls directly rather than through `client.provider.make_request`, because that raises `GenLayerError` on any JSON-RPC error and keeps only code and message, discarding `error.data` (`genlayer_py/provider/provider.py::_raise_on_error`) — and `error.data` is exactly what is wanted. Takes `--sender` (an address, never a key) and makes only `eth_chainId`, `eth_getCode`, `eth_estimateGas` and related read calls. Reports the node's chain id, whether the consensus address the SDK targets actually holds code, the raw JSON-RPC error with `error.data`, a decode of any revert against both bundled ABIs plus `Error(string)` and `Panic(uint256)`, and the same estimate for a far smaller contract through the identical path, so a size-dependent failure shows up as a difference. `--with-value` repeats the estimate with a deposit attached to test the fee hypothesis. |
+| `scripts/diagnose_deploy.py` | Read-only diagnosis over the SDK's own transport. `GenLayerProvider.make_request` reaches Bradbury where a bare `requests.post` was answered with a Cloudflare challenge page, so the transport, headers and endpoint are reused unchanged and only `_raise_on_error` is stepped around for the duration of a call, which makes the raw response available with `error.data` intact (that wrapper keeps only code and message). A call that never reached JSON-RPC is reported as UNAVAILABLE and nothing is concluded from it. | Takes `--sender` (an address, never a key) and makes only `eth_chainId`, `eth_getCode`, `eth_estimateGas` and related read calls. Reports the node's chain id, whether the consensus address the SDK targets actually holds code, the raw JSON-RPC error with `error.data`, a decode of any revert against both bundled ABIs plus `Error(string)` and `Panic(uint256)`, and the same estimate for a far smaller contract through the identical path, so a size-dependent failure shows up as a difference. `--with-value` repeats the estimate with a deposit attached to test the fee hypothesis. |
 | `scripts/deploy_escrow.py` | Same arguments, dry run by default. `--submit` additionally requires `GENLAYER_PRIVATE_KEY` and typing `deploy` at a prompt. |
 
 `prepare_deploy.py` installs `windows_stdin_compat` before using the
@@ -272,6 +272,13 @@ conclusion: a selector can be absent because the deployed contract differs,
 because the revert came from another contract, or because the bundled ABIs
 are partial. It is recorded as "not found in the bundled ABIs" and nothing
 more.
+
+A fourth thing was ruled out as evidence: the first run of
+`diagnose_deploy.py` used a bare `requests.post` and received a Cloudflare
+HTTP 403 HTML page. It then read the missing `result` fields as chain id
+`None` and code size zero and declared both estimates failed. That run never
+reached JSON-RPC and is evidence of nothing; the script now reuses the SDK
+transport and refuses to draw conclusions from unreached calls.
 
 What is **not** established: which of the three it is. That needs a reading
 from the node, so `deploy_escrow.py --preflight` performs the

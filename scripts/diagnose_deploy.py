@@ -106,35 +106,53 @@ def decode_revert(data):
     )
 
 
-def rpc_url(chain):
-    return chain.rpc_urls["default"]["http"][0]
+def raw_via_sdk(client, method, params):
+    """One JSON-RPC call over the SDK's own transport, returned unwrapped.
 
+    genlayer-py 0.16.3 reaches Bradbury where a bare requests.post is turned
+    away by Cloudflare: GenLayerProvider sends its own headers, including
+    User-Agent: genlayer-py, to the configured endpoint. So the transport is
+    reused exactly, and only the error handling is stepped around:
+    _raise_on_error is neutralised for the duration of the call, which makes
+    make_request return the raw response dict with error.data intact.
 
-def raw_rpc(url, method, params, timeout=60):
-    """One JSON-RPC call, returning the response verbatim.
+    Returns one of:
+      {"reached": True,  "response": <raw JSON-RPC dict>}
+      {"reached": False, "reason": "<why the call never reached JSON-RPC>"}
 
-    Never raises on a JSON-RPC error: an error IS the result we are after.
-    Only transport failures raise.
+    The caller must never read a missing result as zero or None: a call that
+    did not reach JSON-RPC is evidence of nothing about the chain.
     """
-    import requests
+    from genlayer_py.exceptions import GenLayerError
 
-    response = requests.post(
-        url,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        headers={"Content-Type": "application/json"},
-        timeout=timeout,
-    )
+    provider = client.provider
+    original = provider._raise_on_error
+
+    provider._raise_on_error = lambda resp, ctx: None
 
     try:
-        return response.json()
-    except ValueError:
-        return {
-            "error": {
-                "code": "non-json",
-                "message": f"HTTP {response.status_code}",
-                "data": response.text[:500],
-            }
-        }
+        return {"reached": True, "response": provider.make_request(method, params)}
+    except GenLayerError as error:
+        # Raised for transport failures and for non-JSON bodies, which is
+        # what a Cloudflare challenge page looks like.
+        return {"reached": False, "reason": f"{type(error).__name__}: {error}"}
+    except Exception as error:  # pragma: no cover - defensive
+        return {"reached": False, "reason": f"{type(error).__name__}: {error}"}
+    finally:
+        provider._raise_on_error = original
+
+
+def describe_transport_failure(reason):
+    lowered = reason.lower()
+
+    if "invalid json" in lowered or "<html" in lowered or "cloudflare" in lowered:
+        return (
+            "the endpoint returned a non-JSON body, which is what an edge "
+            "protection challenge looks like. The call never reached "
+            "JSON-RPC, so it says nothing about the chain or the payload."
+        )
+
+    return "the call never reached JSON-RPC, so it is evidence of nothing."
 
 
 def estimate(client, sender, code_path, value=0, url=None):
@@ -188,34 +206,44 @@ def estimate(client, sender, code_path, value=0, url=None):
         "value": hex(value),
     }
 
-    # Direct POST, not client.provider.make_request: that raises and discards
-    # error.data.
-    raw = raw_rpc(url or rpc_url(client.chain), "eth_estimateGas", [transaction])
+    outcome = raw_via_sdk(client, "eth_estimateGas", [transaction])
 
     return {
         "source_bytes": len(code),
         "calldata_bytes": len(encoded) // 2,
         "value": value,
-        "raw": raw,
+        "outcome": outcome,
     }
 
 
 def report(label, result):
+    """Print one estimate. Returns True, False or None (not reached)."""
     print(f"\n--- {label}")
     print(f"  source {result['source_bytes']} bytes, "
           f"calldata {result['calldata_bytes']} bytes, value {result['value']}")
-    print("  raw JSON-RPC response:")
-    print("    " + json.dumps(result["raw"], default=str)[:1200])
 
-    if not isinstance(result["raw"], dict):
+    outcome = result["outcome"]
+
+    if not outcome["reached"]:
+        print("  UNAVAILABLE: " + outcome["reason"][:300])
+        print("  " + describe_transport_failure(outcome["reason"]))
+
+        return None
+
+    raw = outcome["response"]
+
+    print("  raw JSON-RPC response:")
+    print("    " + json.dumps(raw, default=str)[:1200])
+
+    if not isinstance(raw, dict):
         print("  the node returned something that is not a JSON object")
 
-        return False
+        return None
 
-    error = result["raw"].get("error")
+    error = raw.get("error")
 
     if not error:
-        print(f"  ESTIMATE SUCCEEDED: gas = {result['raw'].get('result')}")
+        print(f"  ESTIMATE SUCCEEDED: gas = {raw.get('result')}")
 
         return True
 
@@ -226,7 +254,8 @@ def report(label, result):
         data = error.get("data")
 
         print(f"  error.data    {str(data)[:200]}")
-        print(f"  decoded       {decode_revert(data if isinstance(data, str) else None)}")
+        print(f"  decoded       "
+              f"{decode_revert(data if isinstance(data, str) else None)}")
     else:
         print("  error.data    ABSENT: the node returned no revert payload, "
               "so no decode is possible")
@@ -258,45 +287,70 @@ def main():
 
     print("Environment")
     print(f"  SDK chain id            {testnet_bradbury.id}")
+    print(f"  rpc                     {client.provider.url}")
 
-    url = args.rpc or rpc_url(testnet_bradbury)
+    chain_call = raw_via_sdk(client, "eth_chainId", [])
 
-    print(f"  rpc                     {url}")
-
-    node_chain = raw_rpc(url, "eth_chainId", [])
-    print(f"  node eth_chainId        {node_chain.get('result')}")
+    if chain_call["reached"]:
+        print(f"  node eth_chainId        {chain_call['response'].get('result')}")
+    else:
+        print("  node eth_chainId        UNAVAILABLE: "
+              + chain_call["reason"][:200])
+        print("    " + describe_transport_failure(chain_call["reason"]))
 
     consensus = testnet_bradbury.consensus_main_contract["address"]
-    code = raw_rpc(url, "eth_getCode", [consensus, "latest"])
-    code_len = max(len(str(code.get("result", "0x"))) - 2, 0) // 2
 
     print(f"  consensus address       {consensus}")
-    print(f"  code at that address    {code_len} bytes"
-          + ("   <-- EMPTY, the SDK is pointing at nothing" if code_len <= 1 else ""))
+
+    code_call = raw_via_sdk(client, "eth_getCode", [consensus, "latest"])
+
+    if code_call["reached"] and "result" in code_call["response"]:
+        code_hex = str(code_call["response"]["result"])
+        code_len = max(len(code_hex) - 2, 0) // 2
+
+        print(f"  code at that address    {code_len} bytes"
+              + ("   <-- EMPTY" if code_len == 0 else ""))
+    else:
+        reason = (
+            code_call["reason"]
+            if not code_call["reached"]
+            else "no result field in the response"
+        )
+
+        # Never report "empty contract" for a call that did not return a
+        # result: absence of an answer is not an answer.
+        print(f"  code at that address    UNKNOWN: {reason[:200]}")
 
     ok_control = report(
         "CONTROL: small contract (escrow_registry.py)",
-        estimate(client, args.sender, CONTROL, url=url),
+        estimate(client, args.sender, CONTROL),
     )
     ok_escrow = report(
         "SUBJECT: project_escrow.py",
-        estimate(client, args.sender, ESCROW, url=url),
+        estimate(client, args.sender, ESCROW),
     )
 
     if args.with_value is not None:
         report(
             f"SUBJECT with value={args.with_value}",
-            estimate(client, args.sender, ESCROW, value=args.with_value, url=url),
+            estimate(client, args.sender, ESCROW, value=args.with_value),
         )
 
     print("\nReading")
 
-    if ok_control and not ok_escrow:
-        print("  The small contract estimates and the large one does not,")
-        print("  through the identical path: consistent with a size limit.")
-    elif not ok_control and not ok_escrow:
-        print("  BOTH fail, so this is not about the escrow's size. Look at")
-        print("  the decoded revert, the consensus address and the fee model.")
+    if ok_control is None or ok_escrow is None:
+        print("  At least one estimate never reached JSON-RPC, so nothing is")
+        print("  concluded here: not about payload size, not about fees, and")
+        print("  not about the consensus address.")
+    elif ok_control and ok_escrow is False:
+        print("  The small contract estimates and the large one reverts,")
+        print("  through the identical encoding and transport. That is")
+        print("  consistent with a payload-size limit OR with a rejection")
+        print("  specific to this contract's source; it does not distinguish")
+        print("  between them. The decoded revert above is the next lead.")
+    elif ok_control is False and ok_escrow is False:
+        print("  BOTH revert, so this is not about the escrow being large.")
+        print("  Look at the decoded revert and the consensus configuration.")
     elif ok_control and ok_escrow:
         print("  Both estimate successfully; the earlier failure was not")
         print("  reproduced by this path.")
