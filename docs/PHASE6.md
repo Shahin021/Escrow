@@ -238,6 +238,40 @@ when it is not, so the documented PowerShell command works as written and a
 file written on Linux is unaffected. A UTF-16 file still fails loudly rather
 than being guessed at.
 
+## The escrow deployment reverts during gas estimation
+
+The SDK path now passes correct typed arguments and the local simulator
+accepts them, yet `client.deploy_contract(...)` fails inside
+`eth_estimateGas` with `execution reverted`, before anything is signed or
+broadcast.
+
+What is established:
+
+* The arguments are not the cause. `prepare_deploy.py` prints
+  `milestones_json` as a `str` with quoted amounts and the constructor
+  accepts them in the simulator.
+* The payload is an order of magnitude larger than anything that has
+  deployed successfully here: the escrow source is 137,970 bytes and the
+  serialized deployment payload is 138,122 bytes, against roughly 9 KB for
+  the registry, 8 KB for the runtime probe and 21 KB for the accepted V2
+  contract. The failing CLI attempt reported `intrinsic gas too low`, which
+  is also consistent with size.
+* `genlayer-py` 0.16.3 sends the deployment with `value=0` and has no
+  fee-deposit logic at all (no `FeeManager`, no `feeValue`), while the CLI
+  exposes `--fee-value` and documents deriving a deposit from FeeManager.
+  So a missing fee deposit is a second candidate.
+
+What is **not** established: which of the two it is. That needs a reading
+from the node, so `deploy_escrow.py --preflight` performs the
+`eth_estimateGas` call alone and reports the result or the revert. It signs
+nothing and broadcasts nothing.
+
+If size is the cause, the options are to reduce the deployed source
+(comments and docstrings are a large share of 138 KB) or to split the
+contract, and either choice changes the deployed artifact and so needs its
+own review. If the fee deposit is the cause, the deployment must go through
+the JS path or a Python client that attaches one.
+
 The separate `intrinsic gas too low` RPC error and `status: 0` receipt are a
 fee-estimation failure, independent of the argument corruption. It should be
 re-checked once a correctly encoded deployment is attempted, since a

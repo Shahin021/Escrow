@@ -189,3 +189,119 @@ def test_the_script_still_rejects_a_bad_argument(tmp_path):
 
     assert result.returncode == 1
     assert "REJECTED: registry must be 0x" in result.stdout
+
+
+# Deployment payload measurement. The deploy attempt failed inside
+# eth_estimateGas with 'execution reverted', before any broadcast. These
+# tests pin what can be checked without a node: that the payload the SDK
+# would serialize is built from the real arguments, and that its size is
+# measured and flagged rather than discovered on-chain.
+
+from scripts.deploy_escrow import (
+    KNOWN_GOOD_SOURCE_BYTES,
+    LARGE_PAYLOAD_BYTES,
+    build_payload,
+    report_size,
+)
+
+CONTRACT_PATH = os.path.join(REPO_ROOT, "contracts", "project_escrow.py")
+REGISTRY_PATH = os.path.join(REPO_ROOT, "contracts", "escrow_registry.py")
+
+ARGS = [
+    WORKER,
+    json.dumps(
+        [{"spec": "Unfunded runtime smoke test", "amount": "1"}],
+        separators=(",", ":"),
+    ),
+    "raw.githubusercontent.com",
+    "text",
+    1,
+    False,
+    "",
+]
+
+
+def test_the_payload_is_built_from_the_real_arguments():
+    code = open(CONTRACT_PATH, "rb").read()
+    measurements = build_payload(ARGS, code)
+
+    assert measurements["source_bytes"] == len(code)
+    # Serialization carries the source plus the encoded constructor call, so
+    # the payload is necessarily larger than the source.
+    assert measurements["payload_bytes"] > measurements["source_bytes"]
+
+    # serialize() hands back a hex string; the measurement must convert it to
+    # bytes rather than counting characters, which would double the figure.
+    payload = measurements["payload"]
+
+    if isinstance(payload, str):
+        text = payload[2:] if payload.startswith("0x") else payload
+
+        assert measurements["payload_bytes"] == len(text) // 2
+
+
+def test_the_escrow_payload_is_flagged_as_large():
+    """The escrow dwarfs everything that has deployed successfully."""
+    measurements = build_payload(ARGS, open(CONTRACT_PATH, "rb").read())
+
+    assert measurements["is_large"] is True
+    assert measurements["payload_bytes"] > LARGE_PAYLOAD_BYTES
+
+    for size in KNOWN_GOOD_SOURCE_BYTES.values():
+        assert measurements["source_bytes"] > size * 5
+
+
+def test_a_small_contract_is_not_flagged():
+    """The threshold must discriminate, not warn about everything."""
+    measurements = build_payload([], open(REGISTRY_PATH, "rb").read())
+
+    assert measurements["is_large"] is False
+
+
+def test_the_size_report_names_the_comparison(capsys):
+    report_size(build_payload(ARGS, open(CONTRACT_PATH, "rb").read()))
+
+    printed = capsys.readouterr().out
+
+    assert "serialized payload" in printed
+    assert "escrow_registry.py" in printed
+    assert "WARNING" in printed
+
+
+def test_the_dry_run_reports_size_and_sends_nothing(tmp_path):
+    """End to end: the deploy script's default path measures and stops."""
+    path = tmp_path / "milestones.json"
+    path.write_bytes(
+        b"\xef\xbb\xbf"
+        + json.dumps(
+            [{"spec": "Unfunded runtime smoke test", "amount": "1"}],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            os.path.join("scripts", "deploy_escrow.py"),
+            "--milestones",
+            str(path),
+            "--worker",
+            WORKER,
+            "--max-revisions",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "serialized payload" in result.stdout
+    assert "DRY RUN: nothing was sent." in result.stdout
+    # The default path must never reach the network.
+    assert "estimate" not in result.stdout.lower()
