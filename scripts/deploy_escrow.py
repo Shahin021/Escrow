@@ -105,11 +105,17 @@ def preflight(constructor_args, code_bytes):
     way to see why the node rejects the deployment, and it reports the revert
     payload when there is one.
     """
+    print(
+        "\nFor a full read-only diagnosis, including the raw JSON-RPC error "
+        "and a size control, use scripts/diagnose_deploy.py --sender 0x...,"
+        "\nwhich needs no key at all."
+    )
+
     key = os.environ.get("GENLAYER_PRIVATE_KEY")
 
     if not key:
-        print("\nGENLAYER_PRIVATE_KEY is not set; cannot build the payload.")
-        print("Preflight needs the sender address only; it signs nothing.")
+        print("\nGENLAYER_PRIVATE_KEY is not set, so this preflight cannot "
+              "run. Use diagnose_deploy.py instead; it takes --sender.")
         sys.exit(1)
 
     from genlayer_py import create_account, create_client
