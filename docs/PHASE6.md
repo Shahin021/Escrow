@@ -374,6 +374,13 @@ the SDK is monkey-patched and no global state is touched. A test drives that
 path with a recording account and asserts the overridden value is what
 reaches the signing boundary; removing the override makes it fail.
 
+The custom submit path must also preserve the SDK caller's raw-transaction
+encoding and receipt behavior. It now ensures the signed transaction is sent
+as `0x`-prefixed hex, and waits for a `FINALIZED` receipt after RPC returns a
+transaction hash. Invalid non-positive `--gas-limit` values are rejected
+before signing. This is a client-script correctness fix, not evidence that
+any particular gas limit is accepted by Bradbury.
+
 Supplying a gas limit does not make deployment possible. The estimate is
 about 98M, and a transaction given less gas than it needs runs out rather
 than becoming cheaper. The flag exists so an authoritative ceiling can be

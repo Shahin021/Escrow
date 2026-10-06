@@ -485,6 +485,62 @@ def test_no_gas_ceiling_is_invented():
         assert guess not in source
 
 
+def test_gas_limit_parser_rejects_non_positive_values():
+    import argparse
+
+    deploy = _deploy_module()
+    assert deploy.positive_int("1234567") == 1_234_567
+    for value in ("0", "-1", "abc"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            deploy.positive_int(value)
+
+
+def test_submission_sends_prefixed_raw_hex_and_waits_for_finalized_receipt():
+    from types import SimpleNamespace
+    from genlayer_py.types import TransactionStatus
+
+    deploy = _deploy_module()
+    provider = _FakeProvider()
+    client = SimpleNamespace(provider=provider)
+    waited = []
+
+    def wait_for_transaction_receipt(**kwargs):
+        waited.append(kwargs)
+        return {"status": "finalized"}
+
+    client.wait_for_transaction_receipt = wait_for_transaction_receipt
+    account = _RecordingAccount()
+    tx_hash, receipt = deploy.submit_deployment(client, account, {"gas": "0x10"})
+
+    assert provider.sent == [["0xdeadbeef"]]
+    assert tx_hash == "0x" + "ab" * 32
+    assert receipt == {"status": "finalized"}
+    assert waited == [{
+        "transaction_hash": tx_hash,
+        "status": TransactionStatus.FINALIZED,
+    }]
+
+
+def test_failed_submission_does_not_wait_for_receipt():
+    from types import SimpleNamespace
+
+    deploy = _deploy_module()
+    provider = _FakeProvider()
+
+    def reject(method, params=None):
+        raise RuntimeError("RPC rejected submission")
+
+    provider.make_request = reject
+    client = SimpleNamespace(provider=provider)
+    waited = []
+    client.wait_for_transaction_receipt = lambda **kwargs: waited.append(kwargs)
+
+    with pytest.raises(RuntimeError, match="RPC rejected submission"):
+        deploy.submit_deployment(client, _RecordingAccount(), {"gas": "0x10"})
+
+    assert waited == []
+
+
 def test_the_dry_run_warns_that_the_estimate_is_used_verbatim(tmp_path):
     path = tmp_path / "milestones.json"
     path.write_bytes(

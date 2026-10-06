@@ -31,6 +31,17 @@ CONTRACT = "contracts/project_escrow.py"
 NETWORK = "testnet_bradbury"
 
 
+def positive_int(value):
+    """argparse converter for an explicitly supplied positive gas limit."""
+    try:
+        parsed = int(value, 10)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("gas limit must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("gas limit must be a positive integer")
+    return parsed
+
+
 # Sizes that are known to have deployed successfully on Bradbury, for
 # comparison. The escrow is an order of magnitude larger, which is the first
 # thing to rule in or out when the node rejects it.
@@ -231,8 +242,27 @@ def sign_deployment(account, transaction):
     signed and submitted."""
     signed = account.sign_transaction(transaction)
     raw = signed.raw_transaction
+    encoded = raw.hex() if hasattr(raw, "hex") else str(raw)
+    return encoded if encoded.startswith("0x") else f"0x{encoded}"
 
-    return raw.hex() if hasattr(raw, "hex") else raw
+
+def submit_deployment(client, account, transaction):
+    """Submit one signed deployment and wait for its finalized receipt."""
+    from genlayer_py.types import TransactionStatus
+
+    raw_transaction = sign_deployment(account, transaction)
+    response = client.provider.make_request(
+        "eth_sendRawTransaction", [raw_transaction]
+    )
+    if not isinstance(response, dict) or not response.get("result"):
+        raise RuntimeError(f"deployment submission returned no transaction hash: {response!r}")
+
+    tx_hash = response["result"]
+    receipt = client.wait_for_transaction_receipt(
+        transaction_hash=tx_hash,
+        status=TransactionStatus.FINALIZED,
+    )
+    return tx_hash, receipt
 
 
 def main():
@@ -252,7 +282,7 @@ def main():
     )
     parser.add_argument(
         "--gas-limit",
-        type=int,
+        type=positive_int,
         default=None,
         help="explicit gas limit for the deployment transaction. Without it "
         "the SDK uses the eth_estimateGas result verbatim "
@@ -333,10 +363,9 @@ def main():
 
     print(f"gas limit in the transaction: {transaction['gas']}")
 
-    signed = sign_deployment(client.local_account, transaction)
-    sent = client.provider.make_request("eth_sendRawTransaction", [signed])
-
-    print(json.dumps(sent, default=str)[:600])
+    tx_hash, receipt = submit_deployment(client, client.local_account, transaction)
+    print(f"transaction {tx_hash}")
+    print(json.dumps(receipt, indent=2, default=str)[:2000])
 
 
 if __name__ == "__main__":
