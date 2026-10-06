@@ -495,14 +495,25 @@ def test_gas_limit_parser_rejects_non_positive_values():
             deploy.positive_int(value)
 
 
-def test_submission_sends_prefixed_raw_hex_and_waits_for_finalized_receipt():
+def test_submission_sends_prefixed_raw_hex_and_waits_for_finalized_receipt(monkeypatch):
+    """Sign/send once, preserve raw hex, then track the decoded GenLayer ID."""
     from types import SimpleNamespace
     from genlayer_py.types import TransactionStatus
+    from scripts import deployment_receipt
 
     deploy = _deploy_module()
     provider = _FakeProvider()
     client = SimpleNamespace(provider=provider)
-    waited = []
+    waited, resolved = [], []
+    evm_hash = "0x" + "ab" * 32
+    genlayer_id = "0x" + "cd" * 32
+    escrow = "0x" + "93" * 20
+
+    def resolve_receipt(receipt_client, receipt_hash):
+        resolved.append((receipt_client, receipt_hash))
+        return genlayer_id, escrow, {"status": 1}
+
+    monkeypatch.setattr(deployment_receipt, "resolve_deployment_transaction", resolve_receipt)
 
     def wait_for_transaction_receipt(**kwargs):
         waited.append(kwargs)
@@ -510,15 +521,19 @@ def test_submission_sends_prefixed_raw_hex_and_waits_for_finalized_receipt():
 
     client.wait_for_transaction_receipt = wait_for_transaction_receipt
     account = _RecordingAccount()
-    tx_hash, receipt = deploy.submit_deployment(client, account, {"gas": "0x10"})
+    tx_id, receipt = deploy.submit_deployment(client, account, {"gas": "0x10"})
 
     assert provider.sent == [["0xdeadbeef"]]
-    assert tx_hash == "0x" + "ab" * 32
+    assert account.signed == [{"gas": "0x10"}]
+    assert resolved == [(client, evm_hash)]
+    assert len(waited) == 1
+    assert waited[0]["transaction_hash"] == genlayer_id
+    assert waited[0]["transaction_hash"] != evm_hash
+    assert waited[0]["status"] == TransactionStatus.FINALIZED
+    assert waited[0]["retries"] == 120
+    assert waited[0]["interval"] == 3000
+    assert tx_id == genlayer_id
     assert receipt == {"status": "finalized"}
-    assert waited == [{
-        "transaction_hash": tx_hash,
-        "status": TransactionStatus.FINALIZED,
-    }]
 
 
 def test_failed_submission_does_not_wait_for_receipt():

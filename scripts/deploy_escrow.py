@@ -247,8 +247,8 @@ def sign_deployment(account, transaction):
 
 
 def submit_deployment(client, account, transaction):
-    """Submit one signed deployment and wait for its finalized receipt."""
-    from genlayer_py.types import TransactionStatus
+    """Submit once; decode the EVM receipt before waiting for GenLayer."""
+    from scripts.deployment_receipt import wait_for_deployment
 
     raw_transaction = sign_deployment(account, transaction)
     response = client.provider.make_request(
@@ -257,16 +257,13 @@ def submit_deployment(client, account, transaction):
     if not isinstance(response, dict) or not response.get("result"):
         raise RuntimeError(f"deployment submission returned no transaction hash: {response!r}")
 
-    tx_hash = response["result"]
-    receipt = client.wait_for_transaction_receipt(
-        transaction_hash=tx_hash,
-        status=TransactionStatus.FINALIZED,
-    )
-    return tx_hash, receipt
+    return wait_for_deployment(client, response["result"])
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--pack-source", action="store_true",
+                        help="compress a deployment copy; preserve the source file")
     parser.add_argument("--milestones", required=True)
     parser.add_argument("--worker", required=True)
     parser.add_argument("--allowed-sources", default="raw.githubusercontent.com")
@@ -293,6 +290,9 @@ def main():
     parser.add_argument("--submit", action="store_true")
     args = parser.parse_args()
 
+    if args.pack_source and getattr(args, "compact_comments", False):
+        parser.error("use --pack-source on the original source without --compact-comments")
+
     milestones, total_required = validate_milestones(
         read_milestones_file(args.milestones)
     )
@@ -316,6 +316,12 @@ def main():
         print(f"  [{index}] {type(value).__name__:5s} {value!r}")
 
     code_bytes = open(CONTRACT, "rb").read()
+
+    if args.pack_source:
+        from scripts.pack_escrow import pack_source
+        original_bytes = len(code_bytes)
+        code_bytes = pack_source(code_bytes)
+        print(f"packed source   {original_bytes} -> {len(code_bytes)} bytes")
 
     report_size(build_payload(constructor_args, code_bytes))
 
