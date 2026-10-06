@@ -21,7 +21,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.prepare_deploy import check_address, validate_milestones  # noqa: E402
+from scripts.prepare_deploy import (  # noqa: E402
+    check_address,
+    read_milestones_file,
+    validate_milestones,
+)
 
 CONTRACT = "contracts/project_escrow.py"
 NETWORK = "testnet_bradbury"
@@ -39,8 +43,9 @@ def main():
     parser.add_argument("--submit", action="store_true")
     args = parser.parse_args()
 
-    with open(args.milestones, encoding="utf-8") as handle:
-        milestones, total_required = validate_milestones(handle.read())
+    milestones, total_required = validate_milestones(
+        read_milestones_file(args.milestones)
+    )
 
     constructor_args = [
         check_address("worker", args.worker),

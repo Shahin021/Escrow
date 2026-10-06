@@ -220,8 +220,15 @@ Use `scripts/deploy_escrow.py`, which builds the arguments in Python where a
 
 | Script | What it does |
 | --- | --- |
-| `scripts/prepare_deploy.py` | Validates the milestones file against the constructor's own rules, prints every decoded argument with its type, computes `total_required` and each appeal bond, then deploys into the local simulator to prove the constructor accepts exactly these arguments. Sends nothing. |
+| `scripts/prepare_deploy.py` | Reads the milestones file as `utf-8-sig`, so a UTF-8 BOM from PowerShell's `Set-Content -Encoding utf8` is handled rather than rejected. Validates it against the constructor's own rules, prints every decoded argument with its type, computes `total_required` and each appeal bond, then deploys into the local simulator to prove the constructor accepts exactly these arguments. Sends nothing. |
 | `scripts/deploy_escrow.py` | Same arguments, dry run by default. `--submit` additionally requires `GENLAYER_PRIVATE_KEY` and typing `deploy` at a prompt. |
+
+Both scripts read the milestones file as `utf-8-sig`. Windows PowerShell
+writes a byte-order mark, which `json.loads` rejects with "Unexpected UTF-8
+BOM"; `utf-8-sig` strips it when present and behaves exactly like `utf-8`
+when it is not, so the documented PowerShell command works as written and a
+file written on Linux is unaffected. A UTF-16 file still fails loudly rather
+than being guessed at.
 
 The separate `intrinsic gas too low` RPC error and `status: 0` receipt are a
 fee-estimation failure, independent of the argument corruption. It should be

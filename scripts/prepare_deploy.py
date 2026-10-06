@@ -58,6 +58,18 @@ def check_address(label, value, allow_empty=False):
     return value
 
 
+def read_milestones_file(path):
+    """Read a milestones file, tolerating a UTF-8 BOM.
+
+    Windows PowerShell's `Set-Content -Encoding utf8` writes a byte-order
+    mark, and json.loads rejects it with "Unexpected UTF-8 BOM". Reading as
+    utf-8-sig strips the mark when present and is identical to utf-8 when it
+    is not, so the documented PowerShell command works as written.
+    """
+    with open(path, encoding="utf-8-sig") as handle:
+        return handle.read()
+
+
 def validate_milestones(raw_text):
     """Mirror the constructor's own rules, so failures surface here."""
     try:
@@ -123,9 +135,7 @@ def main():
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    with open(args.milestones, encoding="utf-8") as handle:
-        raw_text = handle.read()
-
+    raw_text = read_milestones_file(args.milestones)
     milestones, total_required = validate_milestones(raw_text)
 
     worker = check_address("worker", args.worker)
