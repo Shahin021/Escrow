@@ -34,6 +34,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ESCROW = "contracts/project_escrow.py"
 CONTROL = "contracts/escrow_registry.py"
 
+# genlayer-py 0.16.3's provider raises GenLayerError on any JSON-RPC error
+# and keeps only code and message (see provider/provider.py::_raise_on_error),
+# so error.data never reaches the caller. The whole point here is error.data,
+# so the JSON-RPC call is made directly with requests and the response is
+# returned verbatim, errors included. This is still read-only: the only
+# methods used are eth_chainId, eth_getCode and eth_estimateGas.
 ERROR_STRING = "0x08c379a0"  # Error(string)
 PANIC = "0x4e487b71"  # Panic(uint256)
 
@@ -90,14 +96,48 @@ def decode_revert(data):
     if matches:
         return f"{selector} = " + " | ".join(matches)
 
+    # Stated as the observation it is. A selector can be absent because the
+    # deployed contract differs, because the revert came from another
+    # contract entirely, or because the ABI files are partial. This does not
+    # establish any of those.
     return (
-        f"{selector} is NOT in either consensus ABI shipped with genlayer-py. "
-        "That points at a deployed consensus contract this SDK version does "
-        "not describe."
+        f"{selector} was not found in the consensus ABIs bundled with "
+        "genlayer-py 0.16.3"
     )
 
 
-def estimate(client, sender, code_path, value=0):
+def rpc_url(chain):
+    return chain.rpc_urls["default"]["http"][0]
+
+
+def raw_rpc(url, method, params, timeout=60):
+    """One JSON-RPC call, returning the response verbatim.
+
+    Never raises on a JSON-RPC error: an error IS the result we are after.
+    Only transport failures raise.
+    """
+    import requests
+
+    response = requests.post(
+        url,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+
+    try:
+        return response.json()
+    except ValueError:
+        return {
+            "error": {
+                "code": "non-json",
+                "message": f"HTTP {response.status_code}",
+                "data": response.text[:500],
+            }
+        }
+
+
+def estimate(client, sender, code_path, value=0, url=None):
     """Build the deployment payload and ask the node to estimate it."""
     from genlayer_py.abi import calldata
     from genlayer_py.abi.transactions import serialize
@@ -148,7 +188,9 @@ def estimate(client, sender, code_path, value=0):
         "value": hex(value),
     }
 
-    raw = client.provider.make_request("eth_estimateGas", params=[transaction])
+    # Direct POST, not client.provider.make_request: that raises and discards
+    # error.data.
+    raw = raw_rpc(url or rpc_url(client.chain), "eth_estimateGas", [transaction])
 
     return {
         "source_bytes": len(code),
@@ -165,6 +207,11 @@ def report(label, result):
     print("  raw JSON-RPC response:")
     print("    " + json.dumps(result["raw"], default=str)[:1200])
 
+    if not isinstance(result["raw"], dict):
+        print("  the node returned something that is not a JSON object")
+
+        return False
+
     error = result["raw"].get("error")
 
     if not error:
@@ -175,10 +222,14 @@ def report(label, result):
     print(f"  error.code    {error.get('code')}")
     print(f"  error.message {error.get('message')}")
 
-    data = error.get("data")
+    if "data" in error:
+        data = error.get("data")
 
-    print(f"  error.data    {str(data)[:160]}")
-    print(f"  decoded       {decode_revert(data if isinstance(data, str) else None)}")
+        print(f"  error.data    {str(data)[:200]}")
+        print(f"  decoded       {decode_revert(data if isinstance(data, str) else None)}")
+    else:
+        print("  error.data    ABSENT: the node returned no revert payload, "
+              "so no decode is possible")
 
     return False
 
@@ -208,25 +259,35 @@ def main():
     print("Environment")
     print(f"  SDK chain id            {testnet_bradbury.id}")
 
-    node_chain = client.provider.make_request("eth_chainId", params=[])
+    url = args.rpc or rpc_url(testnet_bradbury)
+
+    print(f"  rpc                     {url}")
+
+    node_chain = raw_rpc(url, "eth_chainId", [])
     print(f"  node eth_chainId        {node_chain.get('result')}")
 
     consensus = testnet_bradbury.consensus_main_contract["address"]
-    code = client.provider.make_request("eth_getCode", params=[consensus, "latest"])
-    code_len = len(code.get("result", "0x")) // 2
+    code = raw_rpc(url, "eth_getCode", [consensus, "latest"])
+    code_len = max(len(str(code.get("result", "0x"))) - 2, 0) // 2
 
     print(f"  consensus address       {consensus}")
     print(f"  code at that address    {code_len} bytes"
           + ("   <-- EMPTY, the SDK is pointing at nothing" if code_len <= 1 else ""))
 
-    ok_control = report("CONTROL: small contract (escrow_registry.py)",
-                        estimate(client, args.sender, CONTROL))
-    ok_escrow = report("SUBJECT: project_escrow.py",
-                       estimate(client, args.sender, ESCROW))
+    ok_control = report(
+        "CONTROL: small contract (escrow_registry.py)",
+        estimate(client, args.sender, CONTROL, url=url),
+    )
+    ok_escrow = report(
+        "SUBJECT: project_escrow.py",
+        estimate(client, args.sender, ESCROW, url=url),
+    )
 
     if args.with_value is not None:
-        report(f"SUBJECT with value={args.with_value}",
-               estimate(client, args.sender, ESCROW, value=args.with_value))
+        report(
+            f"SUBJECT with value={args.with_value}",
+            estimate(client, args.sender, ESCROW, value=args.with_value, url=url),
+        )
 
     print("\nReading")
 

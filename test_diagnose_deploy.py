@@ -35,7 +35,16 @@ def _load():
     return module
 
 
-class FakeProvider:
+class RaisingProvider:
+    """Models genlayer-py 0.16.3's real provider.
+
+    provider.py::_raise_on_error raises GenLayerError on ANY JSON-RPC error
+    and keeps only code and message, discarding error.data. A diagnostic that
+    routed through it could never print the revert payload, which is the
+    whole point, so this fake raises the same way and the tests assert the
+    diagnostic does not depend on it.
+    """
+
     def __init__(self, estimate_response):
         self.calls = []
         self.estimate_response = estimate_response
@@ -43,20 +52,58 @@ class FakeProvider:
     def make_request(self, method, params=None):
         self.calls.append(method)
 
-        if method == "eth_estimateGas":
-            return self.estimate_response
+        response = (
+            self.estimate_response
+            if method == "eth_estimateGas"
+            else {"result": "0x1"}
+        )
 
-        return {"result": "0x1"}
+        if response.get("error"):
+            from genlayer_py.exceptions import GenLayerError
+
+            error = response["error"]
+
+            raise GenLayerError(
+                f"{method} failed (code={error.get('code')}): "
+                f"{error.get('message')}"
+            )
+
+        return response
 
 
-def _client(estimate_response):
+FakeProvider = RaisingProvider
+
+
+def _client(estimate_response, captured=None):
     from genlayer_py import create_client
     from genlayer_py.chains import testnet_bradbury
 
     client = create_client(chain=testnet_bradbury)
-    client.provider = FakeProvider(estimate_response)
+    client.provider = RaisingProvider(estimate_response)
 
     return client
+
+
+REVERT_WITH_DATA = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "error": {
+        "code": 3,
+        "message": "execution reverted",
+        "data": "0x90cb8b61",
+    },
+}
+
+
+def _patch_rpc(monkeypatch, module, response, recorder):
+    """Replace the raw JSON-RPC call, so nothing touches the network."""
+
+    def fake_raw_rpc(url, method, params, timeout=60):
+        recorder.append(method)
+
+        return response if method == "eth_estimateGas" else {"result": "0x1"}
+
+    monkeypatch.setattr(module, "raw_rpc", fake_raw_rpc)
 
 
 def test_the_diagnostic_only_makes_read_only_calls():
@@ -110,7 +157,7 @@ def test_a_value_bearing_estimate_is_still_only_an_estimate():
     [
         (None, "no revert data"),
         ("0x", "no revert data"),
-        ("0x90cb8b61", "NOT in either consensus ABI"),
+        ("0x90cb8b61", "not found in the consensus ABIs"),
         ("0x4e487b7100000000000000000000000000000000000000000000000000000000000000" + "11", "Panic(uint256)"),
     ],
 )
@@ -165,4 +212,87 @@ def test_report_marks_failure_and_success(capsys):
 
     assert "raw JSON-RPC response" in printed
     assert "execution reverted" in printed
-    assert "NOT in either consensus ABI" in printed
+    assert "not found in the consensus ABIs" in printed
+
+
+def test_a_revert_is_captured_even_though_the_sdk_provider_would_raise(
+    monkeypatch, capsys
+):
+    """The flaw this fixes.
+
+    The SDK provider raises GenLayerError and keeps only code and message, so
+    a diagnostic built on it could never show error.data. The diagnostic now
+    makes the JSON-RPC call directly, so the revert payload survives.
+    """
+    diag = _load()
+    recorder = []
+
+    _patch_rpc(monkeypatch, diag, REVERT_WITH_DATA, recorder)
+
+    client = _client({"result": "0x5208"})
+    result = diag.estimate(client, SENDER, diag.ESCROW)
+
+    # The raising provider was never used for the estimate.
+    assert client.provider.calls == []
+    assert recorder == ["eth_estimateGas"]
+
+    assert diag.report("subject", result) is False
+
+    printed = capsys.readouterr().out
+
+    assert "execution reverted" in printed
+    assert "0x90cb8b61" in printed, "error.data must survive to the report"
+    assert "not found in the consensus ABIs" in printed
+
+
+def test_a_revert_without_data_says_so_rather_than_guessing(
+    monkeypatch, capsys
+):
+    diag = _load()
+    recorder = []
+
+    _patch_rpc(
+        monkeypatch,
+        diag,
+        {"error": {"code": 3, "message": "execution reverted"}},
+        recorder,
+    )
+
+    client = _client({"result": "0x5208"})
+
+    assert diag.report("subject", diag.estimate(client, SENDER, diag.ESCROW)) is False
+
+    printed = capsys.readouterr().out
+
+    assert "ABSENT" in printed
+    assert "no decode is possible" in printed
+
+
+def test_the_raw_rpc_helper_never_raises_on_a_jsonrpc_error(monkeypatch):
+    """An error IS the result being sought, so it must be returned, not raised."""
+    diag = _load()
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return REVERT_WITH_DATA
+
+    monkeypatch.setattr(
+        "requests.post", lambda *args, **kwargs: FakeResponse()
+    )
+
+    out = diag.raw_rpc("http://example.invalid", "eth_estimateGas", [])
+
+    assert out["error"]["data"] == "0x90cb8b61"
+
+
+def test_an_unknown_selector_is_reported_as_not_found_only():
+    """It must not be presented as proof of a version mismatch."""
+    diag = _load()
+    text = diag.decode_revert("0x90cb8b61")
+
+    assert "not found in the consensus ABIs" in text
+
+    for overclaim in ("mismatch", "does not describe", "stale", "proves"):
+        assert overclaim not in text.lower()
