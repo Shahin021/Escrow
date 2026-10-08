@@ -1,21 +1,23 @@
-name: dApp build (Pages)
+name: dApp build and publish
 
-# Build and verification only. Publishing is deliberately NOT enabled yet:
-# there is no confirmed escrow deployment, so a published site would imply a
-# live app that does not exist. The deploy job below is ready but gated behind
-# a manual run and an environment that has to be configured first.
 on:
   push:
+    branches: [main]
     paths:
       - "dapp/**"
       - ".github/workflows/dapp-pages.yml"
   pull_request:
     paths:
       - "dapp/**"
+      - ".github/workflows/dapp-pages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -29,8 +31,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Vitest 5 requires Node ^22.12 || ^24 || >=26.
           node-version: "22"
+          cache: npm
+          cache-dependency-path: dapp/package-lock.json
 
       - name: Install pinned dependencies
         run: npm ci
@@ -38,13 +41,11 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: Build
-        # Addresses are build-time configuration, never secrets. With none
-        # set, the app builds in its "not configured" read-only state.
+      - name: Build configured Bradbury dashboard
         env:
-          VITE_GENLAYER_NETWORK: ${{ vars.GENLAYER_NETWORK }}
-          VITE_ESCROW_ADDRESS: ${{ vars.ESCROW_ADDRESS }}
-          VITE_REGISTRY_ADDRESS: ${{ vars.REGISTRY_ADDRESS }}
+          VITE_GENLAYER_NETWORK: testnetBradbury
+          VITE_ESCROW_ADDRESS: "0x9304455A1Bad15A6317E1d4de92c9b599bae246C"
+          VITE_REGISTRY_ADDRESS: "0x33c5A0F51Ed10Ee21dC55399ce4A37D525321f99"
         run: npm run build
 
       - name: Upload build for review
@@ -52,3 +53,27 @@ jobs:
         with:
           name: dapp-dist
           path: dapp/dist
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dapp/dist
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Publish dashboard
+        id: deployment
+        uses: actions/deploy-pages@v4
