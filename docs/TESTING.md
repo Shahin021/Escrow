@@ -51,13 +51,29 @@ forward to later commits.
 | Windows | `1a6c24d` | 369 / 369 passed, finalization 13 / 13 | 9 / 9 passed | 2026-10-03 |
 | Linux | `d9526e9` (Phase 3 freeze) | 416 / 416 passed | 9 / 9 passed | 2026-10-03 |
 | Windows | `d9526e9` (Phase 3 freeze) | 416 / 416 passed, 0 failed, 0 skipped, in 13.00s | included in the suite | 2026-10-03 |
+| Windows | `10abdf5` (Phase 4) | 482 / 482 passed, in 32.63s | included in the suite | 2026-10-03 |
+| Linux | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp | included in the suite | 2026-10-05 |
+| Windows | `b85f002` (Phase 6 prep) | 491 / 491 Python, 80 / 80 dApp, `npm audit` 0 vulnerabilities, build OK on Node v24.18.0 | included in the suite | 2026-10-05 |
 
-The frozen Phase 3 code at `d9526e9` is verified on both platforms. The
-Windows run used `.\.venv\Scripts\python.exe -m pytest -q`.
+| Windows | `ae9bafe` (Phase 6 prep) | 83 / 83 dApp, `npm audit` 0 vulnerabilities, build OK | included in the suite | 2026-10-05 |
+| Windows | `d053eef` (Phase 6 prep) | 499 / 499 Python | included in the suite | 2026-10-05 |
+| Linux | Phase 6 review head | 503 / 503 Python, 83 / 83 dApp, `npm audit` 0, build OK | included in the suite | 2026-10-05 |
 
-The earlier `1a6c24d` and `2f107c6` rows are historical: each covers only the
-code at that commit, and neither covers the frozen tree. Commits made after
-`d9526e9` are unverified on both platforms until their own run is recorded.
+The Python total includes `test_deployment_rehearsal.py`, which runs the full
+runbook in glsim rather than Direct Mode, and `test_deployment_prereqs.py`.
+
+The newest rows cover `b85f002` and `ae9bafe`, the branch that reopens the Phase 3 freeze
+with the funding split, interface v2 and the documentation sweep. Both
+platforms ran the Python suite and the dApp suite; the Windows run used
+`.\.venv\Scripts\python.exe -m pytest -q` and `npm test`.
+
+The `10abdf5` row was recorded on the Phase 4 branch in a commit that landed
+after the merge and so never reached `main`; it is restored here rather than
+left missing.
+
+Older rows are historical: each covers only the code at its own commit, and
+none of them covers the current tree. Commits made after `b85f002` are
+unverified on both platforms until their own run is recorded.
 
 ## Windows support
 

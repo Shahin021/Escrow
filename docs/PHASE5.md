@@ -37,6 +37,35 @@ a malformed one, the app shows a "not configured" banner and **writes are
 disabled**; reading is still allowed. Addresses and RPC endpoints are public
 values, not secrets, and nothing secret is read by the frontend or committed.
 
+## The interface version is enforced
+
+The app is written against `genlayer.milestone-escrow.v2`. On every load it
+compares that with the `interface_id` the contract reports, and if they
+differ it disables all writes and says so, rather than sending calls built
+for a different interface. This is why the id was bumped when funding
+changed: a consumer must be able to detect the incompatibility.
+
+The check **fails closed**. Until the contract has actually been read and has
+reported the expected id, the interface counts as unconfirmed and writes stay
+disabled, so a refresh that never ran or that failed cannot leave the app
+dispatching calls against an interface it has not verified.
+
+## Funding is a three-step flow
+
+The contract's funding is deliberately split, because a payable method that
+rejects a wrong amount would strand the deposit (probe L9). The app mirrors
+that:
+
+1. **Deposit** (`fund`, payable) sends any amount; it is always credited.
+2. **Activate funding** (`activate_funding`, non-payable) is offered only
+   once the credited amount equals the project's `total_required`.
+3. **Withdraw deposit credit** (`withdraw_deposit_credit`) returns a wrong or
+   unused deposit through the serialized outflow engine.
+
+The app reads `total_required` and `deposit_credit_held` from the contract,
+so the activate button appears only when activation would actually succeed,
+and the withdraw button whenever credit is held.
+
 ## Calls are built from the contract's own signature
 
 `src/methods.js` transcribes every write method from
@@ -58,7 +87,8 @@ The action list is computed from the connected account's role and the current
 project and milestone state, mirroring the contract's own guards so no button
 is offered that the contract would reject:
 
-* client: fund, propose or accept settlement, withdraw their own proposal
+* client: deposit, activate funding, withdraw deposit credit, propose or
+  accept settlement, withdraw their own proposal
 * worker: submit and replace evidence, claim payment, appeal, abort a failed
   appeal, add and withdraw appeal credit, settlement actions
 * anyone: resolve, mark a review stalled, expire a delivery, finalize a

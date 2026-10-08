@@ -8,9 +8,16 @@ final security review is included here.
 
 ## Composability interface
 
-`ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v1"` plus `interface_id()`,
+`ESCROW_INTERFACE_ID = "genlayer.milestone-escrow.v2"` plus `interface_id()`,
 `is_milestone_released()`, `released_amount()` and `parties()`. Shapes are
 frozen under that id; a change requires a new id.
+
+The id moved from `v1` to `v2` during Phase 6 preparation, when funding was
+split into a payable `fund()` and a non-payable `activate_funding()`,
+`withdraw_deposit_credit()` was added, `parties()` gained `total_required`,
+and `get_accounting()` gained `deposit_credit_held`, `deposits_received` and
+`deposits_refunded`. A v1 consumer would misread the funding flow, so the id
+had to move rather than be silently redefined.
 
 `released_amount()` is zero unless the milestone reached `RELEASED`, so a
 consumer cannot read an amount for work that was only approved or whose

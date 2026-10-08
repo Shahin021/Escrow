@@ -119,6 +119,8 @@ def _fund(engine, escrow, owner, total=TOTAL):
     finally:
         engine.vm._value = 0
 
+    engine.call_method(escrow, "activate_funding", [], sender=owner)
+
     engine.vm.deal(_addr_bytes(escrow), total)
 
 

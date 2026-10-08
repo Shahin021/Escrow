@@ -79,6 +79,9 @@ def _fund(
         direct_vm.value = 0
 
 
+    escrow.activate_funding()
+
+
 def _set_contract_balance(direct_vm, amount):
     direct_vm.deal(
         direct_vm._contract_address,

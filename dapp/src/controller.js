@@ -16,6 +16,7 @@ import { readMilestone, readOutflows, readProject, sendAction } from "./escrow.j
 import { buildCall } from "./methods.js";
 import { milestonePredicates, outflowActions, projectPredicates } from "./predicates.js";
 import { describeMismatch, networkMatches } from "./network.js";
+import { EXPECTED_INTERFACE_ID } from "./config.js";
 import { TX_IDLE } from "./tx.js";
 
 export function createController({ config, networkInfo }) {
@@ -71,12 +72,42 @@ export function createController({ config, networkInfo }) {
       return networkMatches(state.chainId, networkInfo.chainId);
     },
 
+    get interfaceSupported() {
+      // Fail closed: an unread contract is not a supported one. Writes stay
+      // disabled until the contract has actually reported the expected id,
+      // so a refresh that never ran or failed cannot leave the app sending
+      // calls built for an interface it has not confirmed.
+      return (
+        Boolean(state.project) &&
+        state.project.interfaceId === EXPECTED_INTERFACE_ID
+      );
+    },
+
+    get interfaceWarning() {
+      if (api.interfaceSupported) return null;
+
+      if (!state.project) {
+        return (
+          "The contract has not been read yet, so its interface is " +
+          "unconfirmed and actions are disabled."
+        );
+      }
+
+      return (
+        `This contract reports interface ${state.project.interfaceId}, but ` +
+        `this app is built for ${EXPECTED_INTERFACE_ID}. Actions are ` +
+        "disabled because the calls would not match."
+      );
+    },
+
     get writesEnabled() {
-      return writesEnabled({
-        configOk: config.ok,
-        connected: Boolean(state.account && state.client),
-        correctNetwork: api.correctNetwork,
-      });
+      return (
+        writesEnabled({
+          configOk: config.ok,
+          connected: Boolean(state.account && state.client),
+          correctNetwork: api.correctNetwork,
+        }) && api.interfaceSupported
+      );
     },
 
     get reconnectWarning() {
@@ -192,10 +223,19 @@ export function createController({ config, networkInfo }) {
 
     async dispatch(action, { milestoneIndex = 0, input = {}, outflowId } = {}) {
       if (!api.writesEnabled) {
+        // Most specific cause first, so the message names the thing the user
+        // can actually act on.
+        if (!config.ok) {
+          throw new Error(
+            "Writes are disabled: no deployed escrow is configured.",
+          );
+        }
+
         throw new Error(
           api.reconnectWarning ||
             api.networkWarning ||
-            "Writes are disabled: connect a wallet and configure a deployed escrow.",
+            api.interfaceWarning ||
+            "Writes are disabled: connect a wallet.",
         );
       }
 

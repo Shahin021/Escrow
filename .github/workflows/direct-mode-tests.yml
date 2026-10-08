@@ -33,7 +33,7 @@ jobs:
       - name: Read pinned GenVM version from conftest.py
         id: genvm
         run: |
-          VERSION=$(python -c "import re; print(re.search(r'GENVM_VERSION = \"([^\"]+)\"', open('conftest.py').read()).group(1))")
+          VERSION=$(python -c 'import ast; tree=ast.parse(open('"'"'conftest.py'"'"', encoding='"'"'utf-8'"'"').read()); value=next(n.value for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='"'"'GENVM_VERSION'"'"' for t in n.targets)); print(ast.literal_eval(value.args[1] if isinstance(value, ast.Call) else value))')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Pinned GenVM: $VERSION"
 

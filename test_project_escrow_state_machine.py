@@ -68,6 +68,9 @@ def _fund(direct_vm, escrow, client):
         direct_vm.value = 0
 
 
+    escrow.activate_funding()
+
+
 def _snapshot(escrow):
     return {
         "project_status": escrow.get_project_status(),

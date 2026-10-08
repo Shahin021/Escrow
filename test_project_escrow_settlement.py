@@ -151,6 +151,9 @@ def _funded(direct_vm, direct_deploy, direct_owner, direct_alice):
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, TOTAL)
 
     return escrow

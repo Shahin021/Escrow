@@ -32,6 +32,8 @@ export function roleOf(account, project) {
  */
 export const PROJECT_ACTIONS = new Set([
   "fund",
+  "activate_funding",
+  "withdraw_deposit_credit",
   "fund_appeal_credit",
   "withdraw_appeal_credit",
   "propose_settlement",
@@ -78,7 +80,19 @@ export function availableActions({ role, project, milestone }) {
   const status = milestone ? milestone.status : null;
 
   if (projectStatus === "AWAITING_DEPOSIT") {
-    if (role === ROLE_CLIENT) add("fund", "Fund the project");
+    if (role === ROLE_CLIENT) {
+      // Depositing is payable and check-free; activation is a separate,
+      // non-payable call that only succeeds on the exact amount.
+      add("fund", "Deposit funds");
+
+      if (project.depositCreditHeld && project.depositCreditHeld !== "0") {
+        add("withdraw_deposit_credit", "Withdraw deposit credit");
+
+        if (project.depositCreditHeld === project.totalRequired) {
+          add("activate_funding", "Activate funding");
+        }
+      }
+    }
 
     return out;
   }

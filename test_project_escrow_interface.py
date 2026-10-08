@@ -35,7 +35,7 @@ Submit
 Privacy policy
 """
 
-INTERFACE_ID = "genlayer.milestone-escrow.v1"
+INTERFACE_ID = "genlayer.milestone-escrow.v2"
 
 T0 = "2026-09-21T09:33:00Z"
 
@@ -105,11 +105,15 @@ def _fund(direct_vm, escrow, direct_owner):
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     direct_vm.deal(direct_vm._contract_address, TOTAL)
 
 
 PARTIES_KEYS = {
     "interface_id",
+    "total_required",
     "client",
     "worker",
     "project_status",

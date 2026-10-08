@@ -20,6 +20,10 @@ function chainState(overrides = {}) {
     status: "ACTIVE",
     milestoneCount: 2,
     locked: "1000",
+    total_required: "1000",
+    deposit_credit_held: "0",
+    deposits_received: "1000",
+    deposits_refunded: "0",
     queued_out: "0",
     inflight_out: "0",
     bounced_held: "0",
@@ -63,11 +67,12 @@ function fakeClient(scenario) {
     readContract: vi.fn(async ({ functionName, args }) => {
       if (functionName === "parties") {
         return {
-          interface_id: "genlayer.milestone-escrow.v1",
+          interface_id: scenario.interface_id || "genlayer.milestone-escrow.v2",
           client: CLIENT,
           worker: WORKER,
           project_status: scenario.status,
           milestone_count: String(scenario.milestoneCount),
+          total_required: scenario.total_required || "1000",
           total_funded: "1000",
           total_released: "0",
           total_refunded: "0",
@@ -736,5 +741,186 @@ describe("project actions are not repeated per milestone", () => {
     for (const row of controller.actionsByMilestone()) {
       expect(row.actions.map((a) => a.action)).not.toContain("close_project");
     }
+  });
+});
+
+describe("the three-step funding flow", () => {
+  const awaitingDeposit = (overrides = {}) =>
+    chainState({
+      status: "AWAITING_DEPOSIT",
+      locked: "0",
+      total_required: "1000",
+      deposits_received: "0",
+      milestones: [
+        { status: "LOCKED", amount: "600" },
+        { status: "LOCKED", amount: "400" },
+      ],
+      ...overrides,
+    });
+
+  it("deposits any amount as a payable call", async () => {
+    const { controller, client } = await loaded(awaitingDeposit(), {
+      account: CLIENT,
+    });
+
+    const actions = controller.projectActions().map((a) => a.action);
+
+    expect(actions).toContain("fund");
+    // Nothing to activate or withdraw before a deposit exists.
+    expect(actions).not.toContain("activate_funding");
+    expect(actions).not.toContain("withdraw_deposit_credit");
+
+    await controller.dispatch("fund", { input: { amount: "999" } });
+
+    expect(client.writeContract).toHaveBeenCalledWith({
+      address: ESCROW,
+      functionName: "fund",
+      args: [],
+      value: 999n,
+    });
+  });
+
+  it("offers activation only when the credit matches exactly", async () => {
+    const short = await loaded(
+      awaitingDeposit({ deposit_credit_held: "999", deposits_received: "999" }),
+      { account: CLIENT },
+    );
+
+    const shortActions = short.controller
+      .projectActions()
+      .map((a) => a.action);
+
+    // A short deposit can be topped up or taken back, but not activated.
+    expect(shortActions).toContain("fund");
+    expect(shortActions).toContain("withdraw_deposit_credit");
+    expect(shortActions).not.toContain("activate_funding");
+
+    const exact = await loaded(
+      awaitingDeposit({
+        deposit_credit_held: "1000",
+        deposits_received: "1000",
+      }),
+      { account: CLIENT },
+    );
+
+    expect(exact.controller.projectActions().map((a) => a.action)).toContain(
+      "activate_funding",
+    );
+  });
+
+  it("activates funding with no arguments and no value", async () => {
+    const { controller, client } = await loaded(
+      awaitingDeposit({
+        deposit_credit_held: "1000",
+        deposits_received: "1000",
+      }),
+      { account: CLIENT },
+    );
+
+    await controller.dispatch("activate_funding", {});
+
+    expect(client.writeContract).toHaveBeenCalledWith({
+      address: ESCROW,
+      functionName: "activate_funding",
+      args: [],
+      value: 0n,
+    });
+  });
+
+  it("withdraws surplus credit as a decimal string", async () => {
+    const { controller, client } = await loaded(
+      awaitingDeposit({ deposit_credit_held: "1500", deposits_received: "1500" }),
+      { account: CLIENT },
+    );
+
+    await controller.dispatch("withdraw_deposit_credit", {
+      input: { amount: "500" },
+    });
+
+    expect(client.writeContract.mock.calls[0][0]).toMatchObject({
+      functionName: "withdraw_deposit_credit",
+      args: ["500"],
+      value: 0n,
+    });
+  });
+
+  it("refuses a malformed withdrawal instead of sending it", async () => {
+    const { controller, client } = await loaded(
+      awaitingDeposit({ deposit_credit_held: "1500", deposits_received: "1500" }),
+      { account: CLIENT },
+    );
+
+    await expect(
+      controller.dispatch("withdraw_deposit_credit", {
+        input: { amount: "12.5" },
+      }),
+    ).rejects.toThrow(/whole number of wei/);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("offers none of the funding steps to the worker", async () => {
+    const { controller } = await loaded(
+      awaitingDeposit({ deposit_credit_held: "1000", deposits_received: "1000" }),
+      { account: WORKER },
+    );
+
+    const actions = controller.projectActions().map((a) => a.action);
+
+    expect(actions).not.toContain("fund");
+    expect(actions).not.toContain("activate_funding");
+    expect(actions).not.toContain("withdraw_deposit_credit");
+  });
+});
+
+describe("interface version is enforced, not just displayed", () => {
+  it("refuses to drive a contract reporting another interface", async () => {
+    const { controller, client } = await loaded(
+      chainState({ interface_id: "genlayer.milestone-escrow.v1" }),
+      { account: WORKER },
+    );
+
+    expect(controller.interfaceSupported).toBe(false);
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.interfaceWarning).toMatch(/v1.*v2/s);
+
+    await expect(
+      controller.dispatch("resolve", { milestoneIndex: 0 }),
+    ).rejects.toThrow(/interface/i);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("allows writes on the expected interface", async () => {
+    const { controller } = await loaded(chainState(), { account: WORKER });
+
+    expect(controller.interfaceSupported).toBe(true);
+    expect(controller.interfaceWarning).toBeNull();
+    expect(controller.writesEnabled).toBe(true);
+  });
+
+  it("refuses to dispatch before the contract has been read", async () => {
+    const client = fakeClient(chainState());
+    const controller = createController({ config, networkInfo });
+
+    // Wallet connected and on the right chain, but no refresh has run, so
+    // the interface is unconfirmed.
+    controller.setWallet({ client, account: WORKER, chainId: 4221 });
+
+    expect(controller.interfaceSupported).toBe(false);
+    expect(controller.writesEnabled).toBe(false);
+    expect(controller.interfaceWarning).toMatch(/not been read yet/i);
+
+    await expect(
+      controller.dispatch("resolve", { milestoneIndex: 0 }),
+    ).rejects.toThrow(/interface is unconfirmed|not been read yet/i);
+
+    expect(client.writeContract).not.toHaveBeenCalled();
+
+    // Once the contract is read and reports the expected id, writes open.
+    await controller.refresh(client, NOW);
+
+    expect(controller.interfaceSupported).toBe(true);
+    expect(controller.writesEnabled).toBe(true);
   });
 });

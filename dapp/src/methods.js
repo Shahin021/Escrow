@@ -12,17 +12,27 @@
 
 export const METHODS = {
   fund: {
-    label: "Fund the project",
+    label: "Deposit funds",
     payable: true,
     valueFrom: "amount",
     fields: [
       {
         name: "amount",
-        label: "Amount in wei (must equal the total required)",
+        label: "Amount to deposit, in wei",
         kind: "amount",
       },
     ],
     args: () => [],
+  },
+  activate_funding: {
+    label: "Activate funding",
+    fields: [],
+    args: () => [],
+  },
+  withdraw_deposit_credit: {
+    label: "Withdraw deposit credit",
+    fields: [{ name: "amount", label: "Amount in wei", kind: "amount" }],
+    args: (index, input) => [String(input.amount)],
   },
   submit_deliverable: {
     label: "Submit evidence",

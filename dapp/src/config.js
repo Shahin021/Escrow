@@ -14,6 +14,13 @@ export const SUPPORTED_NETWORKS = {
   localnet: { label: "GenLayer localnet", chainId: 61999 },
 };
 
+/**
+ * The contract interface this app is written against. The escrow reports its
+ * own id, and a mismatch means the deployed contract is not the one these
+ * calls were built for, so writes must be refused rather than guessed at.
+ */
+export const EXPECTED_INTERFACE_ID = "genlayer.milestone-escrow.v2";
+
 export const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
 export function isValidAddress(value) {

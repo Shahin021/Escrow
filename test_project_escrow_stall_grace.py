@@ -103,6 +103,9 @@ def _prepare(
     finally:
         direct_vm.value = 0
 
+
+    escrow.activate_funding()
+
     if submit:
         direct_vm.sender = direct_alice
         escrow.submit_deliverable(0, URL_A, "")

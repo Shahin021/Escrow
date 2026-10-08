@@ -91,6 +91,8 @@ def _prepare(
     finally:
         direct_vm.value = 0
 
+    escrow.activate_funding()
+
     direct_vm.sender = direct_alice
     escrow.submit_deliverable(0, ARTIFACT_URL, notes)
 
