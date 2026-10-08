@@ -1,4 +1,4 @@
-﻿# Bradbury escrow smoke test — 2026-10-07
+# Bradbury escrow smoke test — 2026-10-07
 
 ## Environment
 - Network: Bradbury, chain ID 4221
@@ -27,7 +27,7 @@ The escrow native balance was 0x0 before transfer confirmation.
 - Project closure EVM hash: 0x28d0a555107dede942670d30ebf4578be7f96202d89646fdbb8510b81281e02b
 - Project closure GenLayer ID: 0x1d9a1b7adcbcf7913a3c51e9ffc666f237b5d7cb0c2ccb268c5c02d79f25f511
 - Closure status at 17:24 Istanbul: ACCEPTED / AGREE / FINISHED_WITH_RETURN
-- Closure finalization: pending verification
+- Closure finalization verified on 2026-10-08: FINALIZED / AGREE / FINISHED_WITH_RETURN
 
 ## Validation
 - Local Python suite: 552 passed
